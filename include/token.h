@@ -8,7 +8,7 @@
 // TokenRef referencing a Token is destroyed or reset (including as a side
 // effect of a uop being flushed and its storage reset/recycled), the
 // token's refcount reaches zero and it calls back into the owning
-// CriticalityEngine to return its pool slot — "token release triggers
+// TokenEngine to return its pool slot — "token release triggers
 // engine release" is exactly this call chain, not a manually-triggered
 // cleanup step.
 #pragma once
@@ -24,7 +24,7 @@ using Cycle = std::uint64_t;
 
 constexpr InstrId kInvalidInstrId = 0;
 
-class CriticalityEngine;
+class TokenEngine;
 
 class Token {
 public:
@@ -37,7 +37,7 @@ public:
     void notifyExecuted(Addr pc, Cycle now);
 
 private:
-    friend class CriticalityEngine;
+    friend class TokenEngine;
     friend class TokenRef;
 
     void addRef() { ++refcount_; }
@@ -45,7 +45,7 @@ private:
 
     enum class State : std::uint8_t { AwaitingRootExec, AwaitingConsumerExec };
 
-    CriticalityEngine* engine_ = nullptr;
+    TokenEngine* engine_ = nullptr;
     unsigned refcount_ = 0;
     bool valid_ = false;
     State state_ = State::AwaitingRootExec;

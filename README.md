@@ -10,14 +10,14 @@ plain age-based ordering.
   validation plan: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Token API (pool-allocated, refcounted, embedded in your uop class):
   [`include/token.h`](include/token.h) / [`src/token.cpp`](src/token.cpp)
-- Engine API: [`include/criticality_engine.h`](include/criticality_engine.h) /
-  [`src/criticality_engine.cpp`](src/criticality_engine.cpp)
+- Engine API: [`include/token_engine.h`](include/token_engine.h) /
+  [`src/token_engine.cpp`](src/token_engine.cpp)
 - Minimal end-to-end usage / compile smoke test: [`examples/example_usage.cpp`](examples/example_usage.cpp)
 
 ## Build the example
 
 ```bash
-g++ -std=c++17 -Iinclude examples/example_usage.cpp src/criticality_engine.cpp src/token.cpp -o example_usage
+g++ -std=c++17 -Iinclude examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
 ./example_usage
 ```
 
@@ -25,7 +25,7 @@ g++ -std=c++17 -Iinclude examples/example_usage.cpp src/criticality_engine.cpp s
 
 The module is simulator-agnostic (C++17, standard library only). A host
 model embeds a `cacrit::TokenRef` as a plain member of its own uop/
-micro-op class, and wires in calls to `CriticalityEngine::maybeAssignToken`,
+micro-op class, and wires in calls to `TokenEngine::TokenAvailable / TokenEngine::DecodeGetToken`,
 `registerDependency`, `resolveDependents`, `onFlush`, and a read-only
 `isPredictedCritical` query from the issue-queue picker, at its existing
 fetch/rename/execute/squash pipeline events. Token lifetime (including on

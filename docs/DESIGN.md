@@ -3,8 +3,8 @@
 **Audience:** this document is written to brief an engineer or AI coding agent
 well enough to implement the mechanism below inside a cycle-accurate (CA)
 out-of-order CPU performance model, and to extend/retarget the accompanying
-reference implementation (`include/criticality_engine.h`,
-`include/token.h`, `src/criticality_engine.cpp`, `src/token.cpp`) onto a
+reference implementation (`include/token_engine.h`,
+`include/token.h`, `src/token_engine.cpp`, `src/token.cpp`) onto a
 specific host simulator.
 
 **Status:** this is an architectural technique description (not RTL), meant
@@ -55,7 +55,7 @@ online, consumed at fetch).
 | Token | A small, scarce, pool-allocated, reference-counted object that rides along one chain of last-arriving-operand edges, carrying just enough state to measure one edge's latency at a time |
 | TokenRef | A plain RAII handle to a `Token`, embedded directly as a member of the host's own uop/micro-op object — this, not any id-keyed lookup, is what makes a uop "hold" a token |
 | Distance | Cycles between a producer's execution and the execution of the consumer for which it supplied the last-arriving operand |
-| Engine | The `CriticalityEngine`: owns the token pool, the dependency-graph bookkeeping, and the training/prediction tables. A `Token` never computes anything itself — it forwards events to its owning engine |
+| Engine | The `TokenEngine`: owns the token pool, the dependency-graph bookkeeping, and the training/prediction tables. A `Token` never computes anything itself — it forwards events to its owning engine |
 | Training table | PC-indexed table of saturating counters, incremented/decremented by observed distances |
 | Prediction table | PC-indexed 1-bit table (critical / non-critical), promoted from the training table once a counter saturates |
 
@@ -280,11 +280,11 @@ pipeline events essentially every OoO performance model already has:
 
 | Pipeline event (host side) | Call into the engine |
 |---|---|
-| Instruction fetched/renamed | `uop.token = engine.maybeAssignToken(pc);` and, separately, `bool crit = engine.isPredictedCritical(pc);` to tag the instruction for scheduling use |
+| Instruction decoded | `if (engine.TokenAvailable()) uop.token = engine.DecodeGetToken(pc);` and, separately, `bool crit = engine.isPredictedCritical(pc);` to tag the instruction for scheduling use |
 | Dependency discovered at rename, producer still in flight | `engine.registerDependency(consumerId, producerId);` once per such operand |
 | Instruction executes / broadcasts result | see the three-step sequence below — exactly once per instruction |
 | Instruction squashed (branch mispredict, exception, etc.) | `engine.onFlush(id);` for the dependency graph, **and** let the uop's own `TokenRef` member be destroyed/reset as part of normal uop teardown — that alone releases any token it held |
-| Issue-queue select logic | `engine.isPredictedCritical(pc)` (or the tag captured at fetch); combine with `CriticalityEngine::priorityBoost(...)` per §3.6 |
+| Issue-queue select logic | `engine.isPredictedCritical(pc)` (or the tag captured at fetch); combine with `TokenEngine::priorityBoost(...)` per §3.6 |
 
 The execute-time sequence, per §3.3:
 
@@ -428,9 +428,9 @@ implementation above.
       `TokenRef` (RAII handle, meant to be embedded in the host's uop
       class) declarations.
 - [x] `src/token.cpp` — `Token::release()` / `Token::notifyExecuted()`.
-- [x] `include/criticality_engine.h` — public API, `CriticalityConfig`,
-      `CriticalityEngine` class declaration, `CriticalityStats`.
-- [x] `src/criticality_engine.cpp` — implementation of §3.1–§3.5 exactly
+- [x] `include/token_engine.h` — public API, `CriticalityConfig`,
+      `TokenEngine` class declaration, `CriticalityStats`.
+- [x] `src/token_engine.cpp` — implementation of §3.1–§3.5 exactly
       as described above.
 - [x] `examples/example_usage.cpp` — minimal synthetic harness (with a
       toy `Uop` struct embedding a `TokenRef`) exercising the API end to

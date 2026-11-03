@@ -1,4 +1,4 @@
-#include "criticality_engine.h"
+#include "token_engine.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -18,8 +18,8 @@ constexpr std::int32_t clampAdd(std::int32_t value, std::int32_t delta,
 
 } // namespace
 
-struct CriticalityEngine::Impl {
-    Impl(const CriticalityConfig& c, CriticalityEngine* self_)
+struct TokenEngine::Impl {
+    Impl(const CriticalityConfig& c, TokenEngine* self_)
         : cfg(c), self(self_) {
         if (cfg.tokenPoolSize == 0) cfg.tokenPoolSize = 1;
         if (cfg.tokenAssignInterval == 0) cfg.tokenAssignInterval = 1;
@@ -72,19 +72,41 @@ struct CriticalityEngine::Impl {
     std::vector<PredEntry> predTable;
 
     CriticalityConfig cfg;
-    CriticalityEngine* self;
+    TokenEngine* self;
     CriticalityStats stats;
-    std::uint64_t fetchCounter = 0;
+    std::uint64_t decodeCounter = 0;
+    bool lastAvailableCheckPassed = false; // guards DecodeGetToken misuse
 
     std::size_t indexFor(Addr pc, unsigned log2Entries) const {
         return static_cast<std::size_t>((pc >> 2) & ((std::uint64_t{1} << log2Entries) - 1));
     }
 
-    TokenRef maybeAssignToken(Addr pc) {
-        ++fetchCounter;
-        if ((fetchCounter % cfg.tokenAssignInterval) != 0 || freeList.empty()) {
+    // Called once per decoded uop. Always advances the sampling counter
+    // (it tracks decoded uops, not granted tokens) regardless of outcome.
+    bool TokenAvailable() {
+        ++decodeCounter;
+        if (freeList.empty()) {
+            lastAvailableCheckPassed = false;
+            return false;
+        }
+        if (!cfg.pureAvailabilityGating &&
+            (decodeCounter % cfg.tokenAssignInterval) != 0) {
+            lastAvailableCheckPassed = false;
+            return false;
+        }
+        lastAvailableCheckPassed = true;
+        return true;
+    }
+
+    TokenRef DecodeGetToken(Addr pc) {
+        // Defensive fallback: a caller that skips the TokenAvailable()
+        // check, or calls again without rechecking, gets an empty handle
+        // instead of undefined behavior if the pool is actually empty.
+        if (freeList.empty()) {
             return TokenRef{};
         }
+        lastAvailableCheckPassed = false;
+
         std::size_t idx = freeList.back();
         freeList.pop_back();
 
@@ -186,7 +208,7 @@ struct CriticalityEngine::Impl {
     }
 
     // --- Token callbacks (see Token::notifyExecuted / Token::release) --
-    void onTokenExecuted(Token* token, Addr pc, Cycle now) {
+    void UpdateCriticality(Token* token, Addr pc, Cycle now) {
         if (token->state_ == Token::State::AwaitingConsumerExec) {
             std::int64_t distance =
                 static_cast<std::int64_t>(now) - static_cast<std::int64_t>(token->rootExecCycle_);
@@ -197,57 +219,61 @@ struct CriticalityEngine::Impl {
         token->state_ = Token::State::AwaitingConsumerExec;
     }
 
-    void reclaimToken(Token* token) {
+    void TokenRecycle(Token* token) {
         token->valid_ = false;
         freeList.push_back(token->poolIndex_);
         ++stats.tokensRetired;
     }
 };
 
-CriticalityEngine::CriticalityEngine(const CriticalityConfig& cfg)
+TokenEngine::TokenEngine(const CriticalityConfig& cfg)
     : impl_(new Impl(cfg, this)) {}
 
-CriticalityEngine::~CriticalityEngine() { delete impl_; }
+TokenEngine::~TokenEngine() { delete impl_; }
 
-TokenRef CriticalityEngine::maybeAssignToken(Addr pc) {
-    return impl_->maybeAssignToken(pc);
+bool TokenEngine::TokenAvailable() {
+    return impl_->TokenAvailable();
 }
 
-bool CriticalityEngine::isPredictedCritical(Addr pc) const {
+TokenRef TokenEngine::DecodeGetToken(Addr pc) {
+    return impl_->DecodeGetToken(pc);
+}
+
+bool TokenEngine::isPredictedCritical(Addr pc) const {
     return impl_->lookupPrediction(pc);
 }
 
-bool CriticalityEngine::isPredictedCriticalForEviction(Addr pc) const {
+bool TokenEngine::isPredictedCriticalForEviction(Addr pc) const {
     return impl_->lookupPrediction(pc);
 }
 
-void CriticalityEngine::registerDependency(InstrId consumer, InstrId producer) {
+void TokenEngine::registerDependency(InstrId consumer, InstrId producer) {
     impl_->registerDependency(consumer, producer);
 }
 
-InstrId CriticalityEngine::resolveDependents(InstrId producerId) {
+InstrId TokenEngine::resolveDependents(InstrId producerId) {
     return impl_->resolveDependents(producerId);
 }
 
-void CriticalityEngine::onFlush(InstrId id) {
+void TokenEngine::onFlush(InstrId id) {
     impl_->onFlush(id);
 }
 
-std::int32_t CriticalityEngine::priorityBoost(bool predictedCritical,
-                                               std::int32_t boostMagnitude) {
+std::int32_t TokenEngine::priorityBoost(bool predictedCritical,
+                                         std::int32_t boostMagnitude) {
     return predictedCritical ? boostMagnitude : 0;
 }
 
-const CriticalityStats& CriticalityEngine::stats() const {
+const CriticalityStats& TokenEngine::stats() const {
     return impl_->stats;
 }
 
-void CriticalityEngine::onTokenExecuted(Token* token, Addr pc, Cycle now) {
-    impl_->onTokenExecuted(token, pc, now);
+void TokenEngine::UpdateCriticality(Token* token, Addr pc, Cycle now) {
+    impl_->UpdateCriticality(token, pc, now);
 }
 
-void CriticalityEngine::reclaimToken(Token* token) {
-    impl_->reclaimToken(token);
+void TokenEngine::TokenRecycle(Token* token) {
+    impl_->TokenRecycle(token);
 }
 
 } // namespace cacrit

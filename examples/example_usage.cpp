@@ -1,4 +1,4 @@
-// Minimal synthetic harness exercising the CriticalityEngine / Token API
+// Minimal synthetic harness exercising the TokenEngine / Token API
 // end to end, in the shape a real host integration actually takes: a
 // host-owned Uop struct embeds a TokenRef as a plain member, and the
 // engine never tracks tokens by id internally -- the uop IS the owner.
@@ -6,9 +6,9 @@
 // This is a compile/smoke test, not a real simulator integration -- see
 // docs/DESIGN.md S5 for the exact hook contract.
 //
-// Build: g++ -std=c++17 -Iinclude examples/example_usage.cpp src/criticality_engine.cpp src/token.cpp -o example_usage
+// Build: g++ -std=c++17 -Iinclude examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
 
-#include "criticality_engine.h"
+#include "token_engine.h"
 
 #include <cstdio>
 #include <initializer_list>
@@ -34,7 +34,7 @@ int main() {
     cfg.promoteCriticalAt = 1;
     cfg.promoteNonCriticalAt = -1;
 
-    CriticalityEngine engine(cfg);
+    TokenEngine engine(cfg);
 
     // A toy "ROB": the host's own uop-by-id lookup, which this module
     // never needs to know about directly.
@@ -44,7 +44,9 @@ int main() {
         Uop u;
         u.id = id;
         u.pc = pc;
-        u.token = engine.maybeAssignToken(pc); // usually empty; may carry a token
+        if (engine.TokenAvailable()) {
+            u.token = engine.DecodeGetToken(pc); // usually skipped; may carry a token
+        }
         rob[id] = std::move(u);
     };
 
