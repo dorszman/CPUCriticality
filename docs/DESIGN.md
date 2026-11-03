@@ -3,8 +3,9 @@
 **Audience:** this document is written to brief an engineer or AI coding agent
 well enough to implement the mechanism below inside a cycle-accurate (CA)
 out-of-order CPU performance model, and to extend/retarget the accompanying
-reference implementation (`include/criticality_predictor.h`,
-`src/criticality_predictor.cpp`) onto a specific host simulator.
+reference implementation (`include/criticality_engine.h`,
+`include/token.h`, `src/criticality_engine.cpp`, `src/token.cpp`) onto a
+specific host simulator.
 
 **Status:** this is an architectural technique description (not RTL), meant
 for a performance/timing simulator. It describes an *algorithm*, not a
@@ -51,8 +52,10 @@ online, consumed at fetch).
 | Producer | An instruction that generates an operand consumed by a later instruction |
 | Consumer | An instruction waiting on one or more producer operands |
 | Last-arriving operand | Among a consumer's source operands, the one that becomes ready *last* — i.e. the producer that actually determines the consumer's wakeup cycle |
-| Token | A small, scarce tag that rides along one chain of last-arriving-operand edges, carrying just enough state to measure one edge's latency at a time |
+| Token | A small, scarce, pool-allocated, reference-counted object that rides along one chain of last-arriving-operand edges, carrying just enough state to measure one edge's latency at a time |
+| TokenRef | A plain RAII handle to a `Token`, embedded directly as a member of the host's own uop/micro-op object — this, not any id-keyed lookup, is what makes a uop "hold" a token |
 | Distance | Cycles between a producer's execution and the execution of the consumer for which it supplied the last-arriving operand |
+| Engine | The `CriticalityEngine`: owns the token pool, the dependency-graph bookkeeping, and the training/prediction tables. A `Token` never computes anything itself — it forwards events to its owning engine |
 | Training table | PC-indexed table of saturating counters, incremented/decremented by observed distances |
 | Prediction table | PC-indexed 1-bit table (critical / non-critical), promoted from the training table once a counter saturates |
 
@@ -117,34 +120,53 @@ online, consumed at fetch).
 
 ### 3.3 Token hand-off and distance measurement (execute / writeback)
 
-For an instruction `I` executing in cycle `now`:
+The token is not tracked by the engine via any id-keyed lookup. It is a
+pool-allocated, reference-counted `Token` object, and whichever uop
+currently "holds" it does so simply by owning a `TokenRef` member — an
+ordinary RAII handle, exactly like holding any other refcounted resource.
+There is no separate "does instruction X hold a token" table to consult;
+the host already knows, because it is looking at its own uop's member.
 
-1. **Close the previous leg, if `I` was the awaited consumer of an in-flight
-   token.** Compute `distance = now - producerExecCycle` and train the
-   training-table entry indexed by the *producer's* PC (not `I`'s PC) with
-   this distance (see §3.4). This is the measurement the whole mechanism
-   exists to produce: "when this static instruction supplies someone's
-   last-arriving operand, how many cycles typically elapse before that
-   consumer executes?" A short, consistent distance means the dependency
-   chain through this instruction is tight — nothing else had a chance to
-   interleave — which is the behavioral signature of a critical-path edge.
-   A long distance means there was slack: the consumer's actual execution
-   time was not determined by this edge alone.
-2. **Re-root the token at `I`.** Regardless of whether step 1 fired, if `I`
-   currently holds a token, record `producerPC = I`'s PC and
-   `producerExecCycle = now` — this instruction is now the head of the
-   next leg of the chain.
-3. **Resolve `I`'s own dependents** (§3.2). If this identifies a consumer
-   `C` for which `I` supplied the last-arriving operand, and `I` holds a
-   token, hand the token to `C` (the token now waits for `C`'s own
-   execution to close this new leg, per step 1, on a future call).
-4. **Terminate the chain if there is nowhere to extend.** If `I` holds a
-   token but no dependent's count reached zero this cycle, the chain has
-   nothing to extend to; free the token back to the pool immediately. This
-   keeps token occupancy bounded and self-cleaning — there is no scenario
-   where a token sits idle indefinitely.
+For an instruction `I` executing in cycle `now`, with `u` the host's own
+uop object for `I`:
 
-Steps 1–4 are the entire runtime algorithm. Note that dependency-count
+1. **If `u.token` is valid, close the previous leg.** Call
+   `u.token->notifyExecuted(pc, now)`. This is the token's entire public
+   API for criticality tracking — it does not compute anything itself, it
+   forwards the event to its owning engine (`engine_->onTokenExecuted(this,
+   pc, now)`), passing itself as the identity the engine updates state
+   for. Internally, the engine computes `distance = now - rootExecCycle`
+   and trains the training-table entry indexed by the *producer's* PC —
+   i.e. the PC that was running the *previous* time this token's leg was
+   opened, not `I`'s own PC (see §3.4). This is the measurement the whole
+   mechanism exists to produce: "when this static instruction supplies
+   someone's last-arriving operand, how many cycles typically elapse
+   before that consumer executes?" A short, consistent distance means the
+   dependency chain through this instruction is tight — nothing else had
+   a chance to interleave — which is the behavioral signature of a
+   critical-path edge. A long distance means there was slack. The same
+   call also re-roots the token's internal state at `I`'s own PC and
+   `now`, regardless of whether training fired this time, so the token is
+   ready to measure the *next* leg of the chain if one is found below.
+2. **Resolve `I`'s own dependents** (§3.2) by calling
+   `engine.resolveDependents(I)`, independent of whether `u.token` is
+   valid — the dependency graph must stay correct even for edges no token
+   is riding. This returns either `kInvalidInstrId` or the id of the one
+   consumer `C` for which `I` just supplied the last-arriving operand
+   (fairly tie-broken per §3.2 if several became ready simultaneously).
+3. **If `u.token` is valid, hand it off or let it die.** If a consumer `C`
+   was identified, the *host* looks up its own uop object for `C` and
+   copies the `TokenRef`: `host_lookup(C).token = u.token;` — an ordinary
+   refcounted copy, refcount 1→2. Either way, `u.token.reset()` is then
+   called on the producer's own handle: if a copy was made, this merely
+   drops the producer's reference (refcount 2→1, now solely owned by
+   `C`'s uop); if no consumer was found, this was the token's only
+   remaining reference, so the refcount drops to zero and the token is
+   reclaimed back to the pool automatically, inside `Token::release()`.
+   There is no separate "free the token" step to remember to call — it
+   falls out of ordinary reference-counted object lifetime.
+
+This is the entire runtime algorithm. Note that dependency-count
 bookkeeping (§3.2) runs on *every* instruction's execution regardless of
 token state — tokens only gate whether a *measurement* is taken on a given
 edge, not whether the dependency graph itself is tracked.
@@ -227,7 +249,8 @@ training/prediction tables are unchanged and shared.
 
 | Structure | Fields | Default size |
 |---|---|---|
-| Token pool entry | `valid`, `state {AwaitingRootExec, AwaitingConsumerExec}`, `rootPc`, `rootExecCycle`, `pendingId` | 8 entries (3-bit token id) |
+| `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `valid_`, `state_ {AwaitingRootExec, AwaitingConsumerExec}`, `rootPc_`, `rootExecCycle_`, `poolIndex_` | 8 entries (3-bit token id) |
+| `TokenRef` | a single `Token*`; held as a plain member of the host's uop class, not tracked by the engine at all | one per uop, usually null |
 | Training table entry | `valid`, `tag (PC)`, `count` (signed, saturating) | 1024 entries, direct-mapped |
 | Prediction table entry | `valid`, `tag (PC)`, `critical` (1 bit) | 1024 entries, direct-mapped |
 | Dependency bookkeeping | `producer -> [consumer...]`, `consumer -> pendingCount` | sized to in-flight window (ROB-sized upper bound) |
@@ -241,21 +264,47 @@ real design would truncate tag bits to save area.
 
 ## 5. Required integration hooks from the host CA model
 
-The predictor is deliberately decoupled from any specific simulator. The
-host model must call it at exactly these points, which correspond to
+The engine is deliberately decoupled from any specific simulator. The host
+model's own uop/micro-op class must embed one plain member:
+
+```cpp
+#include "token.h"
+struct Uop {
+    /* ... host's own fields ... */
+    cacrit::TokenRef token; // empty (invalid) on almost every uop
+};
+```
+
+and must call the engine at exactly these points, which correspond to
 pipeline events essentially every OoO performance model already has:
 
-| Pipeline event (host side) | Call into predictor |
+| Pipeline event (host side) | Call into the engine |
 |---|---|
-| Instruction fetched/renamed | `bool crit = predictor.onFetch(id, pc);` — use `crit` to tag the instruction for later scheduling use |
-| Dependency discovered at rename, producer still in flight | `predictor.registerDependency(consumerId, producerId);` once per such operand |
-| Instruction executes / broadcasts result | `predictor.onExecute(id, pc, currentCycle);` exactly once per instruction |
-| Instruction squashed (branch mispredict, exception, etc.) | `predictor.onFlush(id);` |
-| Issue-queue select logic | `predictor.isPredictedCritical(pc)` or the tag captured at fetch; combine with `CriticalityPredictor::priorityBoost(...)` per §3.6 |
+| Instruction fetched/renamed | `uop.token = engine.maybeAssignToken(pc);` and, separately, `bool crit = engine.isPredictedCritical(pc);` to tag the instruction for scheduling use |
+| Dependency discovered at rename, producer still in flight | `engine.registerDependency(consumerId, producerId);` once per such operand |
+| Instruction executes / broadcasts result | see the three-step sequence below — exactly once per instruction |
+| Instruction squashed (branch mispredict, exception, etc.) | `engine.onFlush(id);` for the dependency graph, **and** let the uop's own `TokenRef` member be destroyed/reset as part of normal uop teardown — that alone releases any token it held |
+| Issue-queue select logic | `engine.isPredictedCritical(pc)` (or the tag captured at fetch); combine with `CriticalityEngine::priorityBoost(...)` per §3.6 |
 
-No other coupling is required. The predictor never needs to know about
+The execute-time sequence, per §3.3:
+
+```cpp
+if (uop.token.valid()) {
+    uop.token->notifyExecuted(uop.pc, now);
+}
+InstrId readyId = engine.resolveDependents(uop.id);
+if (uop.token.valid()) {
+    if (readyId != kInvalidInstrId) {
+        host_lookup(readyId).token = uop.token; // hand-off: refcount 1 -> 2
+    }
+    uop.token.reset(); // producer's leg is done either way (2->1, or 1->0 + reclaim)
+}
+```
+
+No other coupling is required. The engine never needs to know about
 physical register files, ROB indices, or the host's own instruction
-representation beyond opaque `InstrId`/`Addr`/`Cycle` integers.
+representation beyond opaque `InstrId`/`Addr`/`Cycle` integers and the
+`TokenRef` member on the host's own uop type.
 
 ---
 
@@ -305,44 +354,56 @@ against your workload mix:
 
 ---
 
-## 8. Flush handling and instruction-id lifetime
+## 8. Flush handling and token/id lifetime
 
-A token never needs a reference count: by construction a token has at most
-one pending awaiter at a time (the mechanism tracks a single chain, not a
-fan-out DAG), so its liveness collapses to a single valid bit plus a
-reverse lookup (`InstrId -> token slot`). On `onFlush(id)`, if `id` happens
-to be a token's current awaitee, the token is freed immediately — the same
-effect a refcount reaching zero would have, just without needing a counter
-that can only ever be 0 or 1.
+Tokens use a real reference count (`Token::refcount_`), and that is what
+makes flush handling robust to arbitrary call ordering. A token has, at
+any instant, one or two referencing `TokenRef`s: normally exactly one (the
+uop currently holding it), and transiently two during a hand-off (old
+holder and new holder both reference it for the single statement between
+the copy and the old holder's `reset()`). When the last `TokenRef`
+referencing a token is destroyed or `reset()` — including as an ordinary
+side effect of a flushed uop's storage being destroyed or recycled by the
+host — `Token::release()` decrements the refcount, and at zero calls back
+into the engine (`engine_->reclaimToken(this)`) to return the pool slot.
+**There is no separate "does this flushed id hold a token" step for the
+engine to perform**; `engine.onFlush(id)` does not touch tokens at all.
+This is the direct payoff of making the token a refcounted object owned by
+the uop, rather than something the engine tracks by a parallel id-keyed
+lookup: token lifetime is simply correct C++ object lifetime, independent
+of whatever order flush/execute/hand-off events happen to arrive in.
 
-What does need explicit handling is the other direction: `id` flushed while
-it is still an *unexecuted producer* that some other, surviving consumer is
-depending on. That consumer's pending-operand count can now never
-legitimately reach zero through this path, since the only place it
-decrements is the producer's own `onExecute`, which will never come. The
-reference implementation handles this by having `onFlush` walk the flushed
-instruction's registered dependents and **erase** (not decrement) their
-pending-operand counts — which stops any future producer from mistaking a
-stale count for a genuine last-arriving-operand event, and avoids leaving
-the bookkeeping map entry to linger indefinitely. In most real pipelines
-this case is naturally rare (a flush squashes a contiguous younger suffix
-of the window, so a flushed producer's consumers are almost always flushed
-in the same event), but the module does not rely on that to stay correct.
+What `engine.onFlush(id)` *does* still need to do is unrelated to
+tokens: clean up the plain `InstrId`-keyed dependency-graph bookkeeping
+(`dependents`, `pendingCount`). If a producer is flushed while some other,
+surviving consumer still depends on it, that consumer's pending-operand
+count can never legitimately reach zero through this path, since the only
+place it decrements is the producer's own execute event, which will now
+never come. `onFlush` handles this by walking the flushed instruction's
+registered dependents and **erasing** (not decrementing) their pending
+counts — which stops any future producer from mistaking a stale count for
+a genuine last-arriving-operand event, and avoids leaving the bookkeeping
+map entry to linger indefinitely. In most real pipelines this case is
+naturally rare (a flush squashes a contiguous younger suffix of the
+window, so a flushed producer's consumers are almost always flushed in the
+same event), but the module does not rely on that to stay correct.
 
 **Instruction-id lifetime contract (read this before integrating):** the
-module keys all of its internal state — `dependents`, `pendingCount`,
-`holderIndex` — by the raw `InstrId` the host passes in. If the host reuses
-id values (e.g. a small ROB-tag width recycled as instructions retire), a
-new instruction could alias a still-referenced old id before that old id's
-predictor-side state has been fully cleared (every id touched by
-`onFetch`/`registerDependency` is guaranteed cleared by the matching
-`onExecute` or `onFlush` call — the contract is simply: **do not reuse an
-id until one of those two calls has been made for it**). Hosts whose tags
-are recycled faster than that should widen the id passed to this module
-(e.g. concatenate the ROB tag with a per-slot generation/epoch counter)
-rather than passing the raw recycled tag directly.
+dependency-graph bookkeeping keys its state by the raw `InstrId` the host
+passes in. If the host reuses id values (e.g. a small ROB-tag width
+recycled as instructions retire), a new instruction could alias a
+still-referenced old id before that old id's state has been fully cleared
+(every id touched by `registerDependency` is guaranteed cleared by the
+matching `resolveDependents` call that consumes it, or by `onFlush` — the
+contract is simply: **do not reuse an id until one of those has happened
+for it**). Hosts whose tags are recycled faster than that should widen the
+id passed to this module (e.g. concatenate the ROB tag with a per-slot
+generation/epoch counter) rather than passing the raw recycled tag
+directly. Note this id-reuse concern does not apply to tokens themselves —
+`Token` objects are referenced by pointer via `TokenRef`, not by any
+recycled integer id, so there is nothing to alias there.
 
-## 10. Known limitation worth tracking as a design variant
+## 9. Known limitation worth tracking as a design variant
 
 The distance measured in §3.3 is "producer execution → consumer's actual
 execution," which conflates true dependency latency with any scheduling/
@@ -361,24 +422,30 @@ implementation above.
 
 ---
 
-## 11. Implementation checklist
+## 10. Implementation checklist
 
-- [x] `include/criticality_predictor.h` — public API, `CriticalityConfig`,
-      `CriticalityPredictor` class declaration, `Stats`.
-- [x] `src/criticality_predictor.cpp` — implementation of §3.1–§3.5 exactly
+- [x] `include/token.h` — `Token` (pool-allocated, refcounted) and
+      `TokenRef` (RAII handle, meant to be embedded in the host's uop
+      class) declarations.
+- [x] `src/token.cpp` — `Token::release()` / `Token::notifyExecuted()`.
+- [x] `include/criticality_engine.h` — public API, `CriticalityConfig`,
+      `CriticalityEngine` class declaration, `CriticalityStats`.
+- [x] `src/criticality_engine.cpp` — implementation of §3.1–§3.5 exactly
       as described above.
-- [x] `examples/example_usage.cpp` — minimal synthetic harness exercising
-      the API end to end, usable as a compile-smoke-test.
-- [ ] Host-specific adapter wiring the five hooks in §5 into your actual CA
-      model's pipeline stages (left to the integrating engineer — this is
-      the only piece that is necessarily simulator-specific).
+- [x] `examples/example_usage.cpp` — minimal synthetic harness (with a
+      toy `Uop` struct embedding a `TokenRef`) exercising the API end to
+      end, usable as a compile-smoke-test.
+- [ ] Host-specific adapter wiring the hooks in §5 into your actual CA
+      model's pipeline stages and your real uop class (left to the
+      integrating engineer — this is the only piece that is necessarily
+      simulator-specific).
 - [ ] Reservation-station priority integration per §3.6, in whichever style
       (shifting vs. matrix) your issue queue already uses.
 - [ ] (Optional) cache-controller hook per §3.7.
 
 ---
 
-## 12. Background reading (generic, non-proprietary)
+## 11. Background reading (generic, non-proprietary)
 
 Token-passing / last-arriving-operand critical-path approximation is a
 known family of techniques in the computer-architecture literature on
