@@ -280,7 +280,44 @@ against your workload mix:
 
 ---
 
-## 8. Known limitation worth tracking as a design variant
+## 8. Flush handling and instruction-id lifetime
+
+A token never needs a reference count: by construction a token has at most
+one pending awaiter at a time (the mechanism tracks a single chain, not a
+fan-out DAG), so its liveness collapses to a single valid bit plus a
+reverse lookup (`InstrId -> token slot`). On `onFlush(id)`, if `id` happens
+to be a token's current awaitee, the token is freed immediately — the same
+effect a refcount reaching zero would have, just without needing a counter
+that can only ever be 0 or 1.
+
+What does need explicit handling is the other direction: `id` flushed while
+it is still an *unexecuted producer* that some other, surviving consumer is
+depending on. That consumer's pending-operand count can now never
+legitimately reach zero through this path, since the only place it
+decrements is the producer's own `onExecute`, which will never come. The
+reference implementation handles this by having `onFlush` walk the flushed
+instruction's registered dependents and **erase** (not decrement) their
+pending-operand counts — which stops any future producer from mistaking a
+stale count for a genuine last-arriving-operand event, and avoids leaving
+the bookkeeping map entry to linger indefinitely. In most real pipelines
+this case is naturally rare (a flush squashes a contiguous younger suffix
+of the window, so a flushed producer's consumers are almost always flushed
+in the same event), but the module does not rely on that to stay correct.
+
+**Instruction-id lifetime contract (read this before integrating):** the
+module keys all of its internal state — `dependents`, `pendingCount`,
+`holderIndex` — by the raw `InstrId` the host passes in. If the host reuses
+id values (e.g. a small ROB-tag width recycled as instructions retire), a
+new instruction could alias a still-referenced old id before that old id's
+predictor-side state has been fully cleared (every id touched by
+`onFetch`/`registerDependency` is guaranteed cleared by the matching
+`onExecute` or `onFlush` call — the contract is simply: **do not reuse an
+id until one of those two calls has been made for it**). Hosts whose tags
+are recycled faster than that should widen the id passed to this module
+(e.g. concatenate the ROB tag with a per-slot generation/epoch counter)
+rather than passing the raw recycled tag directly.
+
+## 10. Known limitation worth tracking as a design variant
 
 The distance measured in §3.3 is "producer execution → consumer's actual
 execution," which conflates true dependency latency with any scheduling/
@@ -299,7 +336,7 @@ implementation above.
 
 ---
 
-## 9. Implementation checklist
+## 11. Implementation checklist
 
 - [x] `include/criticality_predictor.h` — public API, `CriticalityConfig`,
       `CriticalityPredictor` class declaration, `Stats`.
@@ -316,7 +353,7 @@ implementation above.
 
 ---
 
-## 10. Background reading (generic, non-proprietary)
+## 12. Background reading (generic, non-proprietary)
 
 Token-passing / last-arriving-operand critical-path approximation is a
 known family of techniques in the computer-architecture literature on

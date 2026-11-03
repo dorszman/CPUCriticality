@@ -198,16 +198,36 @@ struct CriticalityPredictor::Impl {
 
     void onFlush(InstrId id) {
         pendingCount.erase(id);
-        dependents.erase(id);
+
+        // 'id' may be a producer that other, still-in-flight consumers are
+        // waiting on. Since 'id' will now never execute, their pending
+        // count can never legitimately reach zero through this path —
+        // erase it (rather than decrement it) so no future producer
+        // mistakes a stale count for a genuine last-arriving-operand
+        // event, and so the map entry does not linger forever. In a real
+        // pipeline these consumers are almost always flushed in the same
+        // batch anyway (flush squashes a contiguous younger suffix); this
+        // just makes correctness independent of flush ordering/batching.
+        auto depIt = dependents.find(id);
+        if (depIt != dependents.end()) {
+            for (InstrId c : depIt->second) {
+                pendingCount.erase(c);
+            }
+            dependents.erase(depIt);
+        }
+
         auto it = holderIndex.find(id);
         if (it != holderIndex.end()) {
             tokenPool[it->second].valid = false;
             holderIndex.erase(it);
+            ++stats.tokensRetired;
         }
-        // Note: 'id' may still appear in some other producer's dependents
-        // list (if id itself was a consumer awaiting resolution elsewhere).
-        // That is handled lazily and safely in onExecute()'s pendingCount
-        // lookup above, which skips entries with no pendingCount record.
+        // Note: 'id' may still appear in some OTHER producer's dependents
+        // list (if id itself was a consumer awaiting resolution elsewhere,
+        // and that producer has not executed yet). That is handled lazily
+        // and safely in onExecute()'s pendingCount lookup, which skips
+        // entries with no pendingCount record — so no cleanup is needed
+        // there; this call has already removed 'id' as a pendingCount key.
     }
 };
 
