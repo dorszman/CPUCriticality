@@ -85,10 +85,35 @@ online, consumed at fetch).
   consumer that depends on it. **Whichever consumer's count reaches zero as
   a direct result of this producer's completion has just had this producer
   supply its last-arriving operand** — by definition, this is the edge of
-  interest. (If a producer happens to resolve more than one consumer's last
-  operand in the same cycle, picking any one deterministically is an
-  acceptable implementation simplification; it only affects which single
-  chain the sparse sample follows.)
+  interest.
+- **Fan-out is common, and matters for how the tie-break is chosen.** A
+  single producer can resolve several consumers' last-arriving operand in
+  the same cycle — a shared condition code, a loop induction variable, a
+  cache-line fill waking multiple waiting loads. Exactly one token
+  continues forward regardless of fan-out width (forking per sibling would
+  let one wide-fan-out producer exhaust the whole token pool in a single
+  cycle, which defeats the bounded-cost point of this mechanism). Which
+  sibling it continues to must be chosen **fairly**, not by a fixed rule
+  such as "first in program order": a fixed rule picks the *same* sibling
+  on every dynamic instance of the same static fan-out (since the fan-out
+  shape itself is static code structure), which permanently starves every
+  other sibling's edge of ever being sampled. The reference implementation
+  uses reservoir sampling across whichever consumers become ready in that
+  cycle, so every sibling gets an equal long-run chance of being the one a
+  given token follows (verified empirically with a synthetic three-way
+  fan-out harness: ~33/34/33% selection across siblings over 2000 trials).
+- **This does not fully solve fan-out, and it's worth knowing why.**
+  Training is indexed by the *producer's* PC, not by the specific edge —
+  so a producer that is genuinely critical for one consumer but irrelevant
+  for several others still has only one shared counter. Its trained
+  verdict ends up as an implicit average over however its real uses get
+  sampled, which can mask a critical corner-case use sitting among many
+  unimportant ones. Fair tie-breaking makes that average *representative*
+  of the producer's actual fan-out instead of arbitrarily biased toward
+  whichever sibling happens to come first in a list, but it does not give
+  per-edge fidelity. Getting that would require per-edge (not per-PC)
+  prediction state, which is a materially larger table — a deliberate
+  scope boundary of this baseline design, not an oversight.
 
 ### 3.3 Token hand-off and distance measurement (execute / writeback)
 

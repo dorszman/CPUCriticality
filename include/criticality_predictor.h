@@ -54,6 +54,14 @@ struct CriticalityConfig {
     // prediction table as critical / non-critical.
     std::int32_t promoteCriticalAt = 2;
     std::int32_t promoteNonCriticalAt = -2;
+
+    // Seed for the internal PRNG used only to fairly tie-break among
+    // several consumers that become simultaneously ready from the same
+    // producer (fan-out). A fixed default keeps simulation runs
+    // reproducible; vary it to decorrelate multiple predictor instances or
+    // to sweep seeds for sensitivity analysis. Must be nonzero (0 is
+    // remapped to a fixed internal default).
+    std::uint64_t rngSeed = 0x9E3779B97F4A7C15ULL;
 };
 
 // Runtime counters, exposed for validation/tuning (see docs/DESIGN.md, S7).

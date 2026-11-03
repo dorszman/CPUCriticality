@@ -24,6 +24,21 @@ struct CriticalityPredictor::Impl {
         trainTable.resize(std::size_t{1} << cfg.trainingTableEntriesLog2);
         predTable.resize(std::size_t{1} << cfg.predictionTableEntriesLog2);
         if (cfg.tokenAssignInterval == 0) cfg.tokenAssignInterval = 1;
+        rngState = cfg.rngSeed != 0 ? cfg.rngSeed : 0x9E3779B97F4A7C15ULL;
+    }
+
+    // xorshift64star: tiny, fast, deterministic given a fixed seed (so
+    // simulation runs stay reproducible). Only used to fairly tie-break
+    // among simultaneously-ready fan-out consumers (see onExecute below);
+    // not a cryptographic or statistical-quality requirement.
+    std::uint64_t rngState;
+    std::uint64_t nextRandom() {
+        std::uint64_t x = rngState;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        rngState = x;
+        return x * 0x2545F4914F6CDD1DULL;
     }
 
     // --- Token pool -----------------------------------------------------
@@ -170,7 +185,22 @@ struct CriticalityPredictor::Impl {
         // Resolve 'id' as a producer for its registered dependents. This
         // always runs, independent of token state, because the dependency
         // graph must stay correct even for edges no token is riding.
+        //
+        // A single producer can legitimately be the last-arriving operand
+        // for SEVERAL consumers in the same cycle (shared condition code,
+        // a loop induction variable, a cache-line fill waking multiple
+        // waiters, ...). Exactly one token continues forward regardless
+        // (forking per fan-out child would let a single wide-fan-out
+        // producer exhaust the whole pool in one cycle, defeating the
+        // bounded-cost point of this mechanism) — but WHICH sibling it
+        // continues to must be chosen fairly. Picking a fixed sibling
+        // (e.g. "first in the list") would deterministically starve every
+        // other sibling of ever being sampled, since the same static code
+        // reproduces the same fan-out shape every dynamic instance. Use
+        // reservoir sampling instead so every simultaneously-ready sibling
+        // has an equal long-run chance of being the one this token follows.
         InstrId readyConsumer = kInvalidInstrId;
+        unsigned readyCount = 0;
         auto depIt = dependents.find(id);
         if (depIt != dependents.end()) {
             for (InstrId c : depIt->second) {
@@ -178,7 +208,10 @@ struct CriticalityPredictor::Impl {
                 if (cntIt == pendingCount.end()) continue; // c was flushed; ignore
                 if (--(cntIt->second) <= 0) {
                     pendingCount.erase(cntIt);
-                    if (readyConsumer == kInvalidInstrId) readyConsumer = c;
+                    ++readyCount;
+                    if (nextRandom() % readyCount == 0) {
+                        readyConsumer = c;
+                    }
                 }
             }
             dependents.erase(depIt);
