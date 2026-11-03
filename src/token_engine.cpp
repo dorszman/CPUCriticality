@@ -1,14 +1,14 @@
 #include "token_engine.h"
 
 #include <algorithm>
-#include <unordered_map>
+#include <optional>
 #include <vector>
 
 namespace cacrit {
 
 namespace {
 
-constexpr std::int32_t clampAdd(std::int32_t value, std::int32_t delta,
+constexpr std::int32_t ClampAdd(std::int32_t value, std::int32_t delta,
                                  std::int32_t lo, std::int32_t hi) {
     std::int32_t result = value + delta;
     if (result < lo) return lo;
@@ -34,28 +34,11 @@ struct TokenEngine::Impl {
 
         trainTable.resize(std::size_t{1} << cfg.trainingTableEntriesLog2);
         predTable.resize(std::size_t{1} << cfg.predictionTableEntriesLog2);
-
-        rngState = cfg.rngSeed != 0 ? cfg.rngSeed : 0x9E3779B97F4A7C15ULL;
-    }
-
-    // --- PRNG (fan-out tie-break fairness only; see DESIGN.md S3.2) -----
-    std::uint64_t rngState;
-    std::uint64_t nextRandom() {
-        std::uint64_t x = rngState;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        rngState = x;
-        return x * 0x2545F4914F6CDD1DULL;
     }
 
     // --- Token pool ------------------------------------------------------
     std::vector<Token> tokenPool;
     std::vector<std::size_t> freeList;
-
-    // --- Dependency graph bookkeeping -----------------------------------
-    std::unordered_map<InstrId, std::vector<InstrId>> dependents;
-    std::unordered_map<InstrId, std::int32_t> pendingCount;
 
     // --- Training / prediction tables -----------------------------------
     struct TrainEntry {
@@ -75,9 +58,9 @@ struct TokenEngine::Impl {
     TokenEngine* self;
     CriticalityStats stats;
     std::uint64_t decodeCounter = 0;
-    bool lastAvailableCheckPassed = false; // guards DecodeGetToken misuse
+    Cycle currentCycle = 0;
 
-    std::size_t indexFor(Addr pc, unsigned log2Entries) const {
+    std::size_t IndexFor(Addr pc, unsigned log2Entries) const {
         return static_cast<std::size_t>((pc >> 2) & ((std::uint64_t{1} << log2Entries) - 1));
     }
 
@@ -86,15 +69,12 @@ struct TokenEngine::Impl {
     bool TokenAvailable() {
         ++decodeCounter;
         if (freeList.empty()) {
-            lastAvailableCheckPassed = false;
             return false;
         }
         if (!cfg.pureAvailabilityGating &&
             (decodeCounter % cfg.tokenAssignInterval) != 0) {
-            lastAvailableCheckPassed = false;
             return false;
         }
-        lastAvailableCheckPassed = true;
         return true;
     }
 
@@ -105,29 +85,27 @@ struct TokenEngine::Impl {
         if (freeList.empty()) {
             return TokenRef{};
         }
-        lastAvailableCheckPassed = false;
 
         std::size_t idx = freeList.back();
         freeList.pop_back();
 
         Token& t = tokenPool[idx];
         t.valid_ = true;
-        t.state_ = Token::State::AwaitingRootExec;
-        t.rootPc_ = pc;
-        t.rootExecCycle_ = 0;
+        t.pc_ = pc;
+        t.rootExecCycle_.reset();
         t.refcount_ = 0; // TokenRef ctor below brings this to 1
+        // t.epoch_ is deliberately left untouched here: whichever path
+        // most recently returned this slot to the pool (RecycleSlot, via
+        // either a closed measurement or refcount reaching zero) already
+        // bumped it, and the TokenRef constructed below captures that
+        // current value as this new assignment's epoch.
 
         ++stats.tokensAssigned;
         return TokenRef(&t);
     }
 
-    void registerDependency(InstrId consumer, InstrId producer) {
-        dependents[producer].push_back(consumer);
-        pendingCount[consumer] += 1;
-    }
-
-    void trainOn(Addr pc, std::int64_t distance) {
-        std::size_t idx = indexFor(pc, cfg.trainingTableEntriesLog2);
+    void TrainOn(Addr pc, std::int64_t distance) {
+        std::size_t idx = IndexFor(pc, cfg.trainingTableEntriesLog2);
         TrainEntry& e = trainTable[idx];
         if (!e.valid || e.tag != pc) {
             e.valid = true;
@@ -135,23 +113,23 @@ struct TokenEngine::Impl {
             e.count = 0;
         }
         if (distance <= cfg.criticalDistanceCycles) {
-            e.count = clampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
+            e.count = ClampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
         } else if (distance >= cfg.nonCriticalDistanceCycles) {
-            e.count = clampAdd(e.count, -1, cfg.trainCounterMin, cfg.trainCounterMax);
+            e.count = ClampAdd(e.count, -1, cfg.trainCounterMin, cfg.trainCounterMax);
         } else {
             return; // ambiguous zone: no update, no promotion check
         }
         ++stats.trainingEvents;
 
         if (e.count >= cfg.promoteCriticalAt) {
-            promote(pc, true);
+            Promote(pc, true);
         } else if (e.count <= cfg.promoteNonCriticalAt) {
-            promote(pc, false);
+            Promote(pc, false);
         }
     }
 
-    void promote(Addr pc, bool critical) {
-        std::size_t idx = indexFor(pc, cfg.predictionTableEntriesLog2);
+    void Promote(Addr pc, bool critical) {
+        std::size_t idx = IndexFor(pc, cfg.predictionTableEntriesLog2);
         PredEntry& e = predTable[idx];
         e.valid = true;
         e.tag = pc;
@@ -160,69 +138,62 @@ struct TokenEngine::Impl {
         else ++stats.nonCriticalPromotions;
     }
 
-    bool lookupPrediction(Addr pc) const {
-        std::size_t idx = indexFor(pc, cfg.predictionTableEntriesLog2);
+    bool LookupPrediction(Addr pc) const {
+        std::size_t idx = IndexFor(pc, cfg.predictionTableEntriesLog2);
         const PredEntry& e = predTable[idx];
         if (e.valid && e.tag == pc) return e.critical;
         return false; // unknown PC defaults to non-critical (baseline behavior)
     }
 
-    // Resolve 'id' as a producer. Fan-out fairness: see DESIGN.md S3.2.
-    InstrId resolveDependents(InstrId id) {
-        InstrId readyConsumer = kInvalidInstrId;
-        unsigned readyCount = 0;
-        auto depIt = dependents.find(id);
-        if (depIt != dependents.end()) {
-            for (InstrId c : depIt->second) {
-                auto cntIt = pendingCount.find(c);
-                if (cntIt == pendingCount.end()) continue; // c was flushed; ignore
-                if (--(cntIt->second) <= 0) {
-                    pendingCount.erase(cntIt);
-                    ++readyCount;
-                    if (nextRandom() % readyCount == 0) {
-                        readyConsumer = c;
-                    }
-                }
-            }
-            dependents.erase(depIt);
-        }
-        return readyConsumer;
-    }
-
-    void onFlush(InstrId id) {
-        pendingCount.erase(id);
-
-        // 'id' may be a producer that other, still-in-flight consumers
-        // are waiting on; since it will now never execute, erase (not
-        // decrement) their pending counts so no future producer mistakes
-        // a stale count for a genuine last-arriving-operand event.
-        auto depIt = dependents.find(id);
-        if (depIt != dependents.end()) {
-            for (InstrId c : depIt->second) {
-                pendingCount.erase(c);
-            }
-            dependents.erase(depIt);
-        }
-        // Note: any token 'id' held is released via its own TokenRef's
-        // destruction on the host side, not by this call.
-    }
-
-    // --- Token callbacks (see Token::notifyExecuted / Token::release) --
-    void UpdateCriticality(Token* token, Addr pc, Cycle now) {
-        if (token->state_ == Token::State::AwaitingConsumerExec) {
-            std::int64_t distance =
-                static_cast<std::int64_t>(now) - static_cast<std::int64_t>(token->rootExecCycle_);
-            trainOn(token->rootPc_, distance);
-        }
-        token->rootPc_ = pc;
-        token->rootExecCycle_ = now;
-        token->state_ = Token::State::AwaitingConsumerExec;
-    }
-
-    void TokenRecycle(Token* token) {
+    // Returns a slot to the pool and bumps its epoch, regardless of WHY
+    // (refcount hit zero, or the measurement closed and we're recycling
+    // immediately without waiting for stragglers). Bumping the epoch here
+    // is what makes any TokenRef that still thinks it owns this slot
+    // (e.g. a slower fan-out sibling that hasn't executed yet) correctly
+    // treat itself as stale from this point on -- see token.h.
+    void RecycleSlot(Token* token) {
         token->valid_ = false;
+        token->rootExecCycle_.reset();
+        ++token->epoch_;
         freeList.push_back(token->poolIndex_);
-        ++stats.tokensRetired;
+        ++stats.tokensExpired;
+    }
+
+    // --- Token callbacks (see TokenRef::NotifyExecuted / Token::Release) -
+    // Single-hop lifecycle, matching the original mechanism: a token
+    // measures exactly one producer->consumer edge, then its job is done
+    // -- no recursion, no re-rooting, ever (pc_ is fixed at creation).
+    // Only ever called by TokenRef after it has already confirmed its own
+    // epoch is current, so this never needs to check staleness itself.
+    //
+    // Fan-out: a producer's broadcast may wake several consumers at once;
+    // the host hands all of them a copy of the SAME token (refcount > 1
+    // is a normal, intended state here, not just a transient during a
+    // single hand-off). Whichever of those consumers executes first has,
+    // by construction, the shortest distance back to the root -- the
+    // strongest possible critical-path evidence -- so the FIRST call that
+    // reaches the closing branch below trains and immediately recycles
+    // the slot (not waiting for slower siblings to drop their copies);
+    // any slower sibling's later call will, by then, fail the epoch check
+    // in TokenRef::NotifyExecuted() before it ever reaches here.
+    bool UpdateCriticality(Token* token) {
+        if (!token->rootExecCycle_.has_value()) {
+            token->rootExecCycle_ = currentCycle;
+            return true;
+        }
+        std::int64_t distance =
+            static_cast<std::int64_t>(currentCycle) - static_cast<std::int64_t>(*token->rootExecCycle_);
+        TrainOn(token->pc_, distance);
+        RecycleSlot(token); // immediate reuse; do not wait for refcount to reach zero
+        return false;
+    }
+
+    // Called when a TokenRef holding a still-current reference drops it
+    // and refcount reaches zero (the non-racing, no-wakeup, or
+    // flushed-before-execute paths -- nothing closed the measurement, so
+    // RecycleSlot wasn't already triggered by UpdateCriticality above).
+    void TokenExpire(Token* token) {
+        RecycleSlot(token);
     }
 };
 
@@ -230,6 +201,10 @@ TokenEngine::TokenEngine(const CriticalityConfig& cfg)
     : impl_(new Impl(cfg, this)) {}
 
 TokenEngine::~TokenEngine() { delete impl_; }
+
+void TokenEngine::Tick(Cycle now) {
+    impl_->currentCycle = now;
+}
 
 bool TokenEngine::TokenAvailable() {
     return impl_->TokenAvailable();
@@ -239,41 +214,25 @@ TokenRef TokenEngine::DecodeGetToken(Addr pc) {
     return impl_->DecodeGetToken(pc);
 }
 
-bool TokenEngine::isPredictedCritical(Addr pc) const {
-    return impl_->lookupPrediction(pc);
+bool TokenEngine::IsPredictedCritical(Addr pc) const {
+    return impl_->LookupPrediction(pc);
 }
 
-bool TokenEngine::isPredictedCriticalForEviction(Addr pc) const {
-    return impl_->lookupPrediction(pc);
-}
-
-void TokenEngine::registerDependency(InstrId consumer, InstrId producer) {
-    impl_->registerDependency(consumer, producer);
-}
-
-InstrId TokenEngine::resolveDependents(InstrId producerId) {
-    return impl_->resolveDependents(producerId);
-}
-
-void TokenEngine::onFlush(InstrId id) {
-    impl_->onFlush(id);
-}
-
-std::int32_t TokenEngine::priorityBoost(bool predictedCritical,
+std::int32_t TokenEngine::PriorityBoost(bool predictedCritical,
                                          std::int32_t boostMagnitude) {
     return predictedCritical ? boostMagnitude : 0;
 }
 
-const CriticalityStats& TokenEngine::stats() const {
+const CriticalityStats& TokenEngine::Stats() const {
     return impl_->stats;
 }
 
-void TokenEngine::UpdateCriticality(Token* token, Addr pc, Cycle now) {
-    impl_->UpdateCriticality(token, pc, now);
+bool TokenEngine::UpdateCriticality(Token* token) {
+    return impl_->UpdateCriticality(token);
 }
 
-void TokenEngine::TokenRecycle(Token* token) {
-    impl_->TokenRecycle(token);
+void TokenEngine::TokenExpire(Token* token) {
+    impl_->TokenExpire(token);
 }
 
 } // namespace cacrit

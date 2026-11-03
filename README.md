@@ -25,10 +25,17 @@ g++ -std=c++17 -Iinclude examples/example_usage.cpp src/token_engine.cpp src/tok
 
 The module is simulator-agnostic (C++17, standard library only). A host
 model embeds a `cacrit::TokenRef` as a plain member of its own uop/
-micro-op class, and wires in calls to `TokenEngine::TokenAvailable / TokenEngine::DecodeGetToken`,
-`registerDependency`, `resolveDependents`, `onFlush`, and a read-only
-`isPredictedCritical` query from the issue-queue picker, at its existing
-fetch/rename/execute/squash pipeline events. Token lifetime (including on
-flush) is handled by ordinary C++ reference counting on `TokenRef` — there
-is no separate id-keyed token lookup to maintain on the host side. See
+micro-op class, calls `TokenEngine::Tick` once per cycle, and wires in
+`TokenEngine::TokenAvailable` / `DecodeGetToken` at decode and
+`TokenRef::NotifyExecuted` at execute. There is no execute/rename/flush
+hook on the engine at all: hand-off rides directly on the host's own
+issue-queue wakeup logic (a producer whose broadcast wakes one consumer
+hands its token straight to it; wakes several and they each get their own
+copy and race — fastest execute wins, no arbitration needed; wakes nobody
+and the token is simply dropped, treated as non-critical). Token lifetime
+(including on flush, and on immediate slot reuse ahead of a slower
+fan-out straggler) is handled entirely by ordinary, epoch-guarded C++
+reference
+counting on `TokenRef` — there is no id-keyed token lookup, register
+scoreboard, or dependency graph to maintain on the host side. See
 [`docs/DESIGN.md`](docs/DESIGN.md) section 5 for the exact hook contract.

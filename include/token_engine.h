@@ -1,10 +1,17 @@
 // TokenEngine: the token-passing dynamic criticality predictor itself.
-// Owns the token pool, the dependency-graph bookkeeping, and the
-// PC-indexed training/prediction tables. See docs/DESIGN.md for the full
-// mechanism and the exact host integration contract.
+// Owns the token pool and the PC-indexed training/prediction tables. See
+// docs/DESIGN.md for the full mechanism and the exact host integration
+// contract.
 //
 // This header is self-contained (C++17, standard library only) and has no
-// dependency on any particular simulator's internal types.
+// dependency on any particular simulator's internal types. Notably, it
+// has NO dependency-graph bookkeeping of its own: token hand-off rides
+// directly on the host's own issue-queue wakeup/broadcast logic (see
+// token.h) -- a producer delivers its token straight to whichever
+// consumer its broadcast wakes, or drops it if the broadcast wakes
+// nobody. This engine never needs to be told about flush/squash events
+// either -- a flushed uop's TokenRef releases by ordinary object lifetime
+// on the host side.
 #pragma once
 
 #include "token.h"
@@ -60,20 +67,12 @@ struct CriticalityConfig {
     // prediction table as critical / non-critical.
     std::int32_t promoteCriticalAt = 2;
     std::int32_t promoteNonCriticalAt = -2;
-
-    // Seed for the internal PRNG used only to fairly tie-break among
-    // several consumers that become simultaneously ready from the same
-    // producer (fan-out). A fixed default keeps simulation runs
-    // reproducible; vary it to decorrelate multiple engine instances or
-    // to sweep seeds for sensitivity analysis. Must be nonzero (0 is
-    // remapped to a fixed internal default).
-    std::uint64_t rngSeed = 0x9E3779B97F4A7C15ULL;
 };
 
 struct CriticalityStats {
     std::uint64_t tokensAssigned = 0;
-    std::uint64_t tokensRetired = 0;      // refcount reached zero, slot recycled
-    std::uint64_t trainingEvents = 0;     // a distance measurement was taken
+    std::uint64_t tokensExpired = 0;       // refcount reached zero, slot freed
+    std::uint64_t trainingEvents = 0;      // a distance measurement was taken
     std::uint64_t criticalPromotions = 0;
     std::uint64_t nonCriticalPromotions = 0;
 };
@@ -86,7 +85,12 @@ public:
     TokenEngine(const TokenEngine&) = delete;
     TokenEngine& operator=(const TokenEngine&) = delete;
 
-    // --- Hook 1: decode ---------------------------------------------------
+    // Call once per cycle, before any decode/execute hooks for that cycle.
+    // The engine tracks the current cycle internally so it does not need
+    // to be passed to every other call (see Token::NotifyExecuted).
+    void Tick(Cycle now);
+
+    // --- Decode -----------------------------------------------------------
     // Call once per decoded uop, in this order:
     //
     //   if (engine.TokenAvailable()) {
@@ -114,46 +118,43 @@ public:
     // particular dynamic instance was sampled by a token. Call in
     // parallel with your instruction-cache fetch; false (non-critical) is
     // returned for any PC with no trained entry yet.
-    bool isPredictedCritical(Addr pc) const;
-    bool isPredictedCriticalForEviction(Addr pc) const;
+    bool IsPredictedCritical(Addr pc) const;
 
-    // --- Hook 2: dependency resolution (rename / scoreboard) ----------
-    // Call once per source operand of 'consumer' whose producing
-    // instruction 'producer' has NOT yet executed.
-    void registerDependency(InstrId consumer, InstrId producer);
+    // --- Execute, wakeup, and flush: no engine calls at all --------------
+    // There is deliberately no execute/wakeup/flush hook here. On
+    // execute, the host calls Token::NotifyExecuted() (see token.h) and
+    // acts on its return value together with its OWN issue-queue wakeup
+    // result: true plus a woken consumer means hand the TokenRef directly
+    // to that consumer (a plain move, not an engine call); true with no
+    // wakeup, or false, both mean simply drop the TokenRef. On flush (a
+    // uop squashed before executing, or holding a token mid-measurement),
+    // the host's own existing object-lifetime management destroys or
+    // resets that TokenRef, which is sufficient -- see docs/DESIGN.md
+    // S3.2/S3.3/S5/S8 for the exact sequence and why no separate flush
+    // entry point is needed.
 
-    // --- Hook 3: execute / writeback -----------------------------------
-    // Call once per instruction at execute time, independent of token
-    // state: resolves 'producerId' against its registered dependents and
-    // returns the id of the ONE consumer (fairly tie-broken if several
-    // became ready simultaneously) for which 'producerId' just supplied
-    // the last-arriving operand, or kInvalidInstrId if none. The host is
-    // responsible for looking that id up in its own structures and, if
-    // the executing uop currently holds a token, copying that TokenRef
-    // onto the consumer uop (see docs/DESIGN.md S5 for the exact
-    // sequence). This call does not touch tokens itself.
-    InstrId resolveDependents(InstrId producerId);
-
-    // --- Hook 4: flush / squash -----------------------------------------
-    // Call for any instruction removed from the pipeline without
-    // executing. Only cleans up dependency-graph bookkeeping (pending
-    // operand counts); any token the flushed uop held is released
-    // automatically when its TokenRef is destroyed/reset by the host, not
-    // by this call.
-    void onFlush(InstrId id);
-
-    static std::int32_t priorityBoost(bool predictedCritical,
+    static std::int32_t PriorityBoost(bool predictedCritical,
                                        std::int32_t boostMagnitude = 1);
 
-    const CriticalityStats& stats() const;
+    const CriticalityStats& Stats() const;
 
 private:
     friend class Token;
-    // API called by the token itself (Token::notifyExecuted forwards
-    // here), not by the host directly.
-    void UpdateCriticality(Token* token, Addr pc, Cycle now);
-    // Called once a token is dead by refcount (Token::release at 0).
-    void TokenRecycle(Token* token);
+    // API called by the token itself (Token::DoNotifyExecuted forwards
+    // here, only once TokenRef has confirmed its epoch is current), not
+    // by the host directly. Returns true if this was the first execute
+    // (host should check its own wakeup result and hand the token to
+    // whoever got woken, if anyone), false if the measurement just
+    // closed -- in which case the slot has ALREADY been recycled
+    // (epoch bumped, returned to the pool) before this call returns,
+    // regardless of any other TokenRef copies still outstanding. The
+    // host should drop it either way.
+    bool UpdateCriticality(Token* token);
+    // Called once a token is dead by refcount (Token::Release at 0). Not
+    // called for the closed-measurement recycle path, which bumps the
+    // epoch and frees the slot immediately inside UpdateCriticality
+    // instead of waiting for refcount to reach zero.
+    void TokenExpire(Token* token);
 
     struct Impl;
     Impl* impl_;

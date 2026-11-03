@@ -3,17 +3,16 @@
 
 namespace cacrit {
 
-void Token::release() {
+void Token::Release() {
     if (refcount_ == 0) return; // defensive; should not happen
     if (--refcount_ == 0 && engine_) {
-        engine_->TokenRecycle(this);
+        engine_->TokenExpire(this);
     }
 }
 
-void Token::notifyExecuted(Addr pc, Cycle now) {
-    if (engine_) {
-        engine_->UpdateCriticality(this, pc, now);
-    }
+bool Token::DoNotifyExecuted() {
+    if (!engine_) return false;
+    return engine_->UpdateCriticality(this);
 }
 
 } // namespace cacrit

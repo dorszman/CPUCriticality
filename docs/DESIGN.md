@@ -63,113 +63,152 @@ online, consumed at fetch).
 
 ## 3. Mechanism
 
-### 3.1 Sparse token assignment (fetch stage)
+### 3.1 Sparse token assignment (decode stage)
 
 - Maintain a small fixed pool of tokens (reference default: 8 tokens, i.e.
   a 3-bit token ID — deliberately small to bound area/power).
-- As instructions are fetched/renamed, assign a free token to a instruction
-  only occasionally — e.g. on average 1 in N fetched instructions
-  (`tokenAssignInterval`), using a cheap pseudo-random or counter-based
-  trigger. **Do not tag every instruction.** Sparse sampling is what keeps
-  this cheap; the predictor is trained from a statistical sample of the
-  dynamic instruction stream, not from exhaustive tracking.
-- A freshly tagged instruction becomes the *root* of a new chain: it has no
-  predecessor yet, so no training happens until it executes.
+- As instructions are decoded, assign a free token to an instruction only
+  occasionally: call `TokenAvailable()` once per decoded uop — it always
+  advances an internal sampling counter and returns whether a token may be
+  taken right now — then, if true, `DecodeGetToken(pc)` to actually pop a
+  slot and root it at `pc`. By default this fires on average 1 in N
+  decoded uops (`tokenAssignInterval`), undersampling even when the pool
+  has free slots, matching the original mechanism's deliberate sparsity;
+  setting `pureAvailabilityGating` instead gates purely on pool occupancy
+  (every decoded uop is eligible as long as a slot is free, letting
+  scarcity alone throttle sampling — see docs' config comments for the
+  trade-off). **Do not tag every instruction.** Sparse sampling is what
+  keeps this cheap; the predictor is trained from a statistical sample of
+  the dynamic instruction stream, not from exhaustive tracking.
+- A freshly tagged instruction's PC is **fixed for the token's entire
+  lifetime** — it is never reassigned. This single instruction's PC is
+  the only thing ever trained by this token (see §3.3): there is no
+  predecessor yet, so no training happens until the token's *second*
+  execute event.
 
-### 3.2 Last-arriving-operand detection (rename / dependency resolution)
+### 3.2 Hand-off via the host's own issue-queue wakeup logic (no Ptag table, no shadow dependency graph)
 
-- At rename, for every source operand of a newly-renamed instruction whose
-  producer has **not yet executed**, register a dependency edge
-  `(consumer, producer)`. This is bookkeeping any OoO model already needs in
-  some form (register scoreboard / wakeup matrix), so this step mostly
-  reuses existing dependency-tracking logic rather than adding new state.
-- Maintain, per consumer, a count of not-yet-ready source operands.
-- When a producer executes, decrement the pending-operand count of every
-  consumer that depends on it. **Whichever consumer's count reaches zero as
-  a direct result of this producer's completion has just had this producer
-  supply its last-arriving operand** — by definition, this is the edge of
-  interest.
-- **Fan-out is common, and matters for how the tie-break is chosen.** A
-  single producer can resolve several consumers' last-arriving operand in
-  the same cycle — a shared condition code, a loop induction variable, a
-  cache-line fill waking multiple waiting loads. Exactly one token
-  continues forward regardless of fan-out width (forking per sibling would
-  let one wide-fan-out producer exhaust the whole token pool in a single
-  cycle, which defeats the bounded-cost point of this mechanism). Which
-  sibling it continues to must be chosen **fairly**, not by a fixed rule
-  such as "first in program order": a fixed rule picks the *same* sibling
-  on every dynamic instance of the same static fan-out (since the fan-out
-  shape itself is static code structure), which permanently starves every
-  other sibling's edge of ever being sampled. The reference implementation
-  uses reservoir sampling across whichever consumers become ready in that
-  cycle, so every sibling gets an equal long-run chance of being the one a
-  given token follows (verified empirically with a synthetic three-way
-  fan-out harness: ~33/34/33% selection across siblings over 2000 trials).
-- **This does not fully solve fan-out, and it's worth knowing why.**
-  Training is indexed by the *producer's* PC, not by the specific edge —
-  so a producer that is genuinely critical for one consumer but irrelevant
-  for several others still has only one shared counter. Its trained
-  verdict ends up as an implicit average over however its real uses get
-  sampled, which can mask a critical corner-case use sitting among many
-  unimportant ones. Fair tie-breaking makes that average *representative*
-  of the producer's actual fan-out instead of arbitrarily biased toward
-  whichever sibling happens to come first in a list, but it does not give
-  per-edge fidelity. Getting that would require per-edge (not per-PC)
-  prediction state, which is a materially larger table — a deliberate
-  scope boundary of this baseline design, not an oversight.
+There is **no register-scoreboard/Ptag table and no producer→consumer
+dependency graph maintained inside the engine** — two different
+approaches were tried while building this design and both were dropped in
+favor of the current one, for the same underlying reason: real OoO
+hardware already knows exactly this information via its own issue-queue
+wakeup/broadcast logic (which instruction produces which register, and
+which reservation-station entries are waiting to read it), so duplicating
+any part of that as a parallel structure inside this module is redundant,
+costly, and a source of its own bugs. Token hand-off rides directly on
+that existing wakeup logic instead:
 
-### 3.3 Token hand-off and distance measurement (execute / writeback)
+- When the uop holding a token executes, its result broadcast wakes
+  whichever reservation-station entries were waiting on it — this is the
+  host's own ordinary wakeup/match logic, unmodified. The host checks the
+  outcome of that broadcast at the same point it calls `notifyExecuted()`
+  (§3.3).
+- **If the broadcast woke exactly one consumer**, the token is handed off
+  directly to that consumer's `TokenRef` — a plain host-side move, not a
+  call into this module.
+- **If the broadcast woke nobody** — no instruction currently in the issue
+  queue was waiting on this result — the token simply does not propagate.
+  It is dropped immediately, on the spot: nothing is gated by this
+  producer right now, so there is nothing further to measure. This is a
+  deliberate, explicit rule, not an inferred default: a producer whose
+  result nobody was waiting for never gets a chance to train anything,
+  and stays at the engine's baseline non-critical prediction for any PC
+  with no trained entry (§3.5).
+- **If several entries are woken simultaneously** by one broadcast (a
+  shared condition code, a cache-line fill waking multiple loads), the
+  token is handed to **all** of them — an ordinary `TokenRef` copy to
+  each, refcount rising accordingly, still a single pool slot — and they
+  race (§3.3). This replaced an earlier version of this design where the
+  host had to pick one woken consumer itself (with reservoir sampling
+  recommended for fairness, since picking the same sibling every dynamic
+  instance would starve the others). That host-side arbitration is no
+  longer necessary: racing resolves fan-out *correctly*, not just
+  *fairly* — see §3.3.
 
-The token is not tracked by the engine via any id-keyed lookup. It is a
-pool-allocated, reference-counted `Token` object, and whichever uop
-currently "holds" it does so simply by owning a `TokenRef` member — an
-ordinary RAII handle, exactly like holding any other refcounted resource.
-There is no separate "does instruction X hold a token" table to consult;
-the host already knows, because it is looking at its own uop's member.
+### 3.3 Single-hop distance measurement, and resolving fan-out by racing (execute)
 
-For an instruction `I` executing in cycle `now`, with `u` the host's own
-uop object for `I`:
+A token measures **exactly one** producer→consumer edge, then its job is
+done — this matches the original mechanism's token lifecycle exactly (a
+token trains the one PC it was originally assigned to, once, then is
+flushed and made available for a fresh, unrelated reassignment — confirmed
+directly against the primary patent specification text, not inferred).
+The engine does not track *which* instruction currently holds a token by
+any id; the token itself is a pool-allocated, reference-counted object,
+and whichever uop currently "holds" it does so simply by owning a
+`TokenRef` — an ordinary RAII handle.
 
-1. **If `u.token` is valid, close the previous leg.** Call
-   `u.token->notifyExecuted(pc, now)`. This is the token's entire public
-   API for criticality tracking — it does not compute anything itself, it
-   forwards the event to its owning engine (`engine_->onTokenExecuted(this,
-   pc, now)`), passing itself as the identity the engine updates state
-   for. Internally, the engine computes `distance = now - rootExecCycle`
-   and trains the training-table entry indexed by the *producer's* PC —
-   i.e. the PC that was running the *previous* time this token's leg was
-   opened, not `I`'s own PC (see §3.4). This is the measurement the whole
-   mechanism exists to produce: "when this static instruction supplies
-   someone's last-arriving operand, how many cycles typically elapse
-   before that consumer executes?" A short, consistent distance means the
-   dependency chain through this instruction is tight — nothing else had
-   a chance to interleave — which is the behavioral signature of a
-   critical-path edge. A long distance means there was slack. The same
-   call also re-roots the token's internal state at `I`'s own PC and
-   `now`, regardless of whether training fired this time, so the token is
-   ready to measure the *next* leg of the chain if one is found below.
-2. **Resolve `I`'s own dependents** (§3.2) by calling
-   `engine.resolveDependents(I)`, independent of whether `u.token` is
-   valid — the dependency graph must stay correct even for edges no token
-   is riding. This returns either `kInvalidInstrId` or the id of the one
-   consumer `C` for which `I` just supplied the last-arriving operand
-   (fairly tie-broken per §3.2 if several became ready simultaneously).
-3. **If `u.token` is valid, hand it off or let it die.** If a consumer `C`
-   was identified, the *host* looks up its own uop object for `C` and
-   copies the `TokenRef`: `host_lookup(C).token = u.token;` — an ordinary
-   refcounted copy, refcount 1→2. Either way, `u.token.reset()` is then
-   called on the producer's own handle: if a copy was made, this merely
-   drops the producer's reference (refcount 2→1, now solely owned by
-   `C`'s uop); if no consumer was found, this was the token's only
-   remaining reference, so the refcount drops to zero and the token is
-   reclaimed back to the pool automatically, inside `Token::release()`.
-   There is no separate "free the token" step to remember to call — it
-   falls out of ordinary reference-counted object lifetime.
+Call `token.NotifyExecuted()` (on the `TokenRef`, not the token directly —
+there is no public way to reach `Token` except through it) exactly once,
+whenever the uop currently holding that `TokenRef` executes. It takes no
+PC or cycle argument: the PC is fixed at token creation (§3.1) and never
+changes, and the current cycle is tracked internally by the engine (see
+`TokenEngine::Tick`, §5) rather than threaded through every call. Note
+this also answers a question worth stating explicitly: the patent's own
+distance definition is execution-to-execution, not wakeup-to-execution —
+there is no need to separately record when a consumer became *ready*, only
+when it actually *executed*. (A wakeup-to-retirement variant was discussed
+as a possible improvement in §9 below; that is this project's own
+extension, not something the original mechanism does.)
 
-This is the entire runtime algorithm. Note that dependency-count
-bookkeeping (§3.2) runs on *every* instruction's execution regardless of
-token state — tokens only gate whether a *measurement* is taken on a given
-edge, not whether the dependency graph itself is tracked.
+`NotifyExecuted()` returns a `bool`:
+
+- **`true`** — this was the token's *first* execute. Its production cycle
+  was just recorded (internally, via an `std::optional<Cycle>` that goes
+  from empty to set — there is no separate boolean "state" field; presence
+  of a value *is* the signal). Nothing is trained yet. The host should
+  consult its own wakeup result from this broadcast (§3.2): hand a copy of
+  the token to every consumer that got woken (one copy if one woken, none
+  if none), or drop it if nobody did.
+- **`false`** — either this call closed the measurement, or it was a stale
+  no-op (see below); the host cannot tell which, and does not need to. The
+  host should simply **drop** the token now (`Reset()` its `TokenRef`)
+  regardless — there is no third leg in this design.
+
+**Resolving fan-out by racing, not arbitrating.** If the producer's
+broadcast woke several consumers, they each hold their own copy of the
+same token (§3.2) and all eventually call `NotifyExecuted()`. Whichever of
+them executes *first* necessarily has the shortest distance back to the
+root — distance is monotonic in execute cycle from a fixed root — so it is
+automatically the strongest critical-path evidence, with **no comparison
+across siblings needed**: the first call to reach the closing branch
+trains the token's fixed PC against that shortest distance, **and
+immediately recycles the slot** (bumps its epoch, returns it to the free
+list) rather than waiting for the slower siblings to drop their copies
+naturally. "First to execute wins" falls directly out of the ordering of
+calls, not out of any explicit winner-selection step.
+
+**Why this needs an epoch, not just a "closed" flag.** Because the slot is
+reused *immediately* on close — not once every outstanding `TokenRef` has
+been dropped — a slower sibling's copy is now a reference to a pool slot
+that may, by the time it finally executes, belong to a completely
+different, unrelated instruction's fresh sample. A simple "already closed"
+boolean on the token can't distinguish "you lost the race for *this*
+measurement" from "this slot has moved on to a *different* measurement
+entirely" — both look identical to a flag that's just sitting there
+`true`. Each `Token` instead carries an `epoch_` counter, bumped exactly
+once every time its slot returns to the pool for any reason (closed
+measurement, refcount reaching zero with no wakeup, a flush). Each
+`TokenRef` captures the epoch current *at the time it was created or
+copied*. Every operation a `TokenRef` performs — `AddRef` on copy,
+`Release` on drop, `NotifyExecuted` — first checks whether its captured
+epoch still matches the token's current one, and is a complete no-op if
+not: it doesn't train, doesn't touch the refcount, doesn't do anything.
+This is what makes immediate reuse safe: a stale sibling calling in later
+can never corrupt whatever the slot has since been reassigned to measure,
+and never double-decrements a refcount that's already been reset for a
+new owner.
+
+Token expiry/recycling is never a separate step the host must remember to
+call: it falls out of ordinary reference-counted, epoch-guarded object
+lifetime. Whether a slot was recycled because a measurement closed
+(immediately, inside that call, independent of stragglers), because a
+broadcast woke nobody, or because the uop holding it was flushed before
+executing, the mechanism is the same underlying helper
+(`TokenEngine::Impl::RecycleSlot`) reached either via
+`Token::Release()` → `TokenEngine::TokenExpire` (refcount hit zero) or
+directly from `TokenEngine::UpdateCriticality` (measurement closed) — see
+§8.
 
 ### 3.4 Training table (PC-indexed, saturating counter)
 
@@ -249,23 +288,26 @@ training/prediction tables are unchanged and shared.
 
 | Structure | Fields | Default size |
 |---|---|---|
-| `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `valid_`, `state_ {AwaitingRootExec, AwaitingConsumerExec}`, `rootPc_`, `rootExecCycle_`, `poolIndex_` | 8 entries (3-bit token id) |
-| `TokenRef` | a single `Token*`; held as a plain member of the host's uop class, not tracked by the engine at all | one per uop, usually null |
+| `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `valid_`, `epoch_` (bumped every time the slot returns to the pool, for any reason), `pc_` (fixed at creation), `rootExecCycle_` (`std::optional<Cycle>` — empty until the first execute; its presence alone distinguishes "first execute" from "closing execute", no separate state field), `poolIndex_` | 8 entries (3-bit token id) |
+| `TokenRef` | a single `Token*`; held as a plain member of the host's uop class — never tracked by the engine itself | one per uop, usually null |
 | Training table entry | `valid`, `tag (PC)`, `count` (signed, saturating) | 1024 entries, direct-mapped |
 | Prediction table entry | `valid`, `tag (PC)`, `critical` (1 bit) | 1024 entries, direct-mapped |
-| Dependency bookkeeping | `producer -> [consumer...]`, `consumer -> pendingCount` | sized to in-flight window (ROB-sized upper bound) |
 
 Direct-mapped, PC-truncated-tag tables are the cheap realistic choice for
 both training and prediction tables; the reference implementation stores
 full PCs for simplicity/correctness in a functional model and notes where a
-real design would truncate tag bits to save area.
+real design would truncate tag bits to save area. There is no register
+scoreboard table and no dependency bookkeeping structure at all (see
+§3.2) — hand-off rides directly on the host's own issue-queue wakeup
+logic instead of any shadow structure this module would otherwise have to
+maintain.
 
 ---
 
 ## 5. Required integration hooks from the host CA model
 
-The engine is deliberately decoupled from any specific simulator. The host
-model's own uop/micro-op class must embed one plain member:
+The engine is deliberately decoupled from any specific simulator. The
+host model's own uop/micro-op class must embed one plain member:
 
 ```cpp
 #include "token.h"
@@ -280,31 +322,39 @@ pipeline events essentially every OoO performance model already has:
 
 | Pipeline event (host side) | Call into the engine |
 |---|---|
-| Instruction decoded | `if (engine.TokenAvailable()) uop.token = engine.DecodeGetToken(pc);` and, separately, `bool crit = engine.isPredictedCritical(pc);` to tag the instruction for scheduling use |
-| Dependency discovered at rename, producer still in flight | `engine.registerDependency(consumerId, producerId);` once per such operand |
-| Instruction executes / broadcasts result | see the three-step sequence below — exactly once per instruction |
-| Instruction squashed (branch mispredict, exception, etc.) | `engine.onFlush(id);` for the dependency graph, **and** let the uop's own `TokenRef` member be destroyed/reset as part of normal uop teardown — that alone releases any token it held |
-| Issue-queue select logic | `engine.isPredictedCritical(pc)` (or the tag captured at fetch); combine with `TokenEngine::priorityBoost(...)` per §3.6 |
+| Once per cycle, before any decode/execute hooks that cycle | `engine.Tick(now);` — the engine tracks the current cycle internally so it is never threaded through other calls |
+| Instruction decoded | `if (engine.TokenAvailable()) uop.token = engine.DecodeGetToken(pc);` and, separately, `bool crit = engine.IsPredictedCritical(pc);` to tag the instruction for scheduling use |
+| Instruction executes / broadcasts result | see the sequence below — exactly once per instruction, alongside whatever the host's own wakeup/match logic already does on this broadcast |
+| Instruction squashed (branch mispredict, exception, etc.) | **no engine call at all** — just let the uop's `TokenRef` member be destroyed/reset as part of normal teardown; that alone releases any token it held (§8) |
+| Issue-queue select logic | `engine.IsPredictedCritical(pc)` (or the tag captured at fetch); combine with `TokenEngine::PriorityBoost(...)` per §3.6 |
 
-The execute-time sequence, per §3.3:
+The execute-time sequence, per §3.2/§3.3:
 
 ```cpp
-if (uop.token.valid()) {
-    uop.token->notifyExecuted(uop.pc, now);
-}
-InstrId readyId = engine.resolveDependents(uop.id);
-if (uop.token.valid()) {
-    if (readyId != kInvalidInstrId) {
-        host_lookup(readyId).token = uop.token; // hand-off: refcount 1 -> 2
+// 'woken' is whatever the host's OWN issue-queue wakeup/match logic
+// already determines for this broadcast -- the ids of every consumer it
+// woke (zero, one, or several). This module has no part in computing it.
+if (uop.token.Valid()) {
+    bool firstExecute = uop.token.NotifyExecuted(); // on the TokenRef, no pc/cycle args
+    if (firstExecute && !woken.empty()) {
+        // First execute: hand every woken consumer its OWN copy. If
+        // several, they race -- the fastest one to execute wins (§3.3).
+        for (auto id : woken) {
+            consumerUop(id).token = uop.token; // copy, not move
+        }
     }
-    uop.token.reset(); // producer's leg is done either way (2->1, or 1->0 + reclaim)
+    // Either way the producer's own reference is done with it now: if
+    // copies were handed out this just drops the producer's share
+    // (siblings keep theirs); if nothing was woken, or this call itself
+    // closed the measurement, this is the token's last live reference.
+    uop.token.Reset();
 }
 ```
 
 No other coupling is required. The engine never needs to know about
-physical register files, ROB indices, or the host's own instruction
-representation beyond opaque `InstrId`/`Addr`/`Cycle` integers and the
-`TokenRef` member on the host's own uop type.
+physical register files, ROB indices, issue-queue internals, or the
+host's own instruction representation beyond opaque `Addr`/`Cycle`
+integers and the `TokenRef` member on the host's own uop type.
 
 ---
 
@@ -316,6 +366,11 @@ against your workload mix:
 - `tokenPoolSize`: trade-off between statistical sample rate and area/power.
 - `tokenAssignInterval`: sparsity of sampling; smaller = more samples, more
   power, faster convergence; larger = cheaper, slower/noisier convergence.
+  Ignored when `pureAvailabilityGating` is set.
+- `pureAvailabilityGating`: `false` (default) samples on the interval above
+  regardless of pool occupancy; `true` instead grants a token to every
+  decoded uop as long as a slot is free, letting pool scarcity alone
+  throttle the rate (see §3.1).
 - `criticalDistanceCycles` / `nonCriticalDistanceCycles`: should bracket the
   expected "back-to-back, no slack" latency for your pipeline's bypass
   network (e.g. near 1–2 cycles for ALU-to-ALU forwarding) versus a distance
@@ -328,16 +383,23 @@ against your workload mix:
 
 ## 7. Validation plan
 
-1. **Unit-level correctness.** Build a synthetic dependency chain (a fixed
-   sequence of registered producer/consumer edges with known execute
-   cycles) and assert the predictor trains the expected PCs critical/
-   non-critical given deliberately short/long synthetic distances.
-2. **Chain termination / token reuse.** Verify tokens are reclaimed when a
-   chain dead-ends (no dependent ready), and that the token pool never
-   exceeds its configured size (no leaks across flush events).
-3. **Flush correctness.** Inject squash events mid-chain and verify no
-   stale training occurs from instructions that never actually executed in
-   the committed path.
+1. **Unit-level correctness.** Build a synthetic producer/consumer edge
+   (decode a producer, decode a consumer that registers interest in its
+   result in your toy wakeup map, two `Tick` + `NotifyExecuted()` calls at
+   known cycles, with the second call's return value used to hand the
+   token to the woken consumer) and assert the predictor trains the
+   expected PC critical/non-critical given deliberately short/long
+   synthetic distances.
+2. **Expiry / token reuse.** Verify a token is expired (reclaimed to the
+   pool, via a dropped `TokenRef`) whenever its producer's broadcast wakes
+   nobody, and that the token pool never exceeds its configured size (no
+   leaks across any of: closed measurement, dropped on an unwoken
+   broadcast, flushed uop).
+3. **Flush correctness.** Destroy a uop's `TokenRef` mid-measurement
+   (simulating a squash) and verify the token expires cleanly with no
+   crash and no stale training from an instruction that never actually
+   executed in the committed path — there is no explicit engine call to
+   make for this; it is pure RAII (§8).
 4. **Full-model integration.** Wire the hooks into your CA model's existing
    fetch/rename/execute/flush events (per §5) and measure, relative to a
    pure age-based baseline:
@@ -354,54 +416,47 @@ against your workload mix:
 
 ---
 
-## 8. Flush handling and token/id lifetime
+## 8. Flush handling and token lifetime
 
-Tokens use a real reference count (`Token::refcount_`), and that is what
-makes flush handling robust to arbitrary call ordering. A token has, at
-any instant, one or two referencing `TokenRef`s: normally exactly one (the
-uop currently holding it), and transiently two during a hand-off (old
-holder and new holder both reference it for the single statement between
-the copy and the old holder's `reset()`). When the last `TokenRef`
-referencing a token is destroyed or `reset()` — including as an ordinary
-side effect of a flushed uop's storage being destroyed or recycled by the
-host — `Token::release()` decrements the refcount, and at zero calls back
-into the engine (`engine_->reclaimToken(this)`) to return the pool slot.
-**There is no separate "does this flushed id hold a token" step for the
-engine to perform**; `engine.onFlush(id)` does not touch tokens at all.
-This is the direct payoff of making the token a refcounted object owned by
-the uop, rather than something the engine tracks by a parallel id-keyed
-lookup: token lifetime is simply correct C++ object lifetime, independent
-of whatever order flush/execute/hand-off events happen to arrive in.
+Tokens use a real reference count (`Token::refcount_`) *and* an epoch
+(`Token::epoch_`, §3.3), and together they make flush handling robust to
+arbitrary call ordering — including a slot being recycled while a stale
+reference to it still technically exists — with **zero engine calls
+involved**: there is no `onFlush` entry point at all, because there is
+nothing left for it to do.
 
-What `engine.onFlush(id)` *does* still need to do is unrelated to
-tokens: clean up the plain `InstrId`-keyed dependency-graph bookkeeping
-(`dependents`, `pendingCount`). If a producer is flushed while some other,
-surviving consumer still depends on it, that consumer's pending-operand
-count can never legitimately reach zero through this path, since the only
-place it decrements is the producer's own execute event, which will now
-never come. `onFlush` handles this by walking the flushed instruction's
-registered dependents and **erasing** (not decrementing) their pending
-counts — which stops any future producer from mistaking a stale count for
-a genuine last-arriving-operand event, and avoids leaving the bookkeeping
-map entry to linger indefinitely. In most real pipelines this case is
-naturally rare (a flush squashes a contiguous younger suffix of the
-window, so a flushed producer's consumers are almost always flushed in the
-same event), but the module does not rely on that to stay correct.
+A token may be referenced by one `TokenRef` (the common case) or by
+several at once (a fan-out race in progress, §3.2/§3.3) — each living in
+whichever uop currently holds it. Every uop is an ordinary object with its
+own normal lifetime that the host already manages for unrelated reasons —
+flushed on a branch misprediction, retired normally, whatever the host
+already does. When a `TokenRef` is destroyed or `Reset()` — including as a
+side effect of any of those ordinary teardown paths — it first checks
+whether its captured epoch still matches the token's current one
+(§3.3); if not, it does nothing at all (the slot has already moved on to
+a different instruction). If current, `Token::Release()` decrements the
+refcount, and at zero calls back into the engine
+(`engine_->TokenExpire(this)` → the same `RecycleSlot` helper used when a
+measurement closes, §3.3) to return the pool slot and bump its epoch.
 
-**Instruction-id lifetime contract (read this before integrating):** the
-dependency-graph bookkeeping keys its state by the raw `InstrId` the host
-passes in. If the host reuses id values (e.g. a small ROB-tag width
-recycled as instructions retire), a new instruction could alias a
-still-referenced old id before that old id's state has been fully cleared
-(every id touched by `registerDependency` is guaranteed cleared by the
-matching `resolveDependents` call that consumes it, or by `onFlush` — the
-contract is simply: **do not reuse an id until one of those has happened
-for it**). Hosts whose tags are recycled faster than that should widen the
-id passed to this module (e.g. concatenate the ROB tag with a per-slot
-generation/epoch counter) rather than passing the raw recycled tag
-directly. Note this id-reuse concern does not apply to tokens themselves —
-`Token` objects are referenced by pointer via `TokenRef`, not by any
-recycled integer id, so there is nothing to alias there.
+This means token lifetime is simply correct, epoch-guarded C++ object
+lifetime, full stop. There is no "does this flushed uop hold a token, and
+if so tell the engine" step to remember anywhere — not on squash, not
+when a broadcast wakes nobody and the host drops the token on purpose, not
+when a measurement closes normally and the host calls `.Reset()` on
+purpose (§3.3), not when a slower fan-out sibling finally gets around to
+dropping a reference to a slot that's long since been reassigned.
+Whatever the reason a `TokenRef` goes away, the outcome is identical and
+automatic — and safe, specifically *because* of the epoch check, in the
+one case (immediate slot reuse ahead of a straggler) where refcounting
+alone would not have been.
+
+This also means there is nothing analogous to the earlier
+"instruction-id reuse" concern this document used to describe: that
+applied to a shadow dependency graph keyed by host instruction ids, which
+no longer exists (§3.2). `Token` objects are referenced purely by pointer
+via `TokenRef`; there is no integer id anywhere in this module's state to
+accidentally alias across a recycled tag.
 
 ## 9. Known limitation worth tracking as a design variant
 
