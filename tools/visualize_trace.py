@@ -24,6 +24,10 @@ FIELD_RE = re.compile(r"(\w+)=(\S+)")
 HEX_FIELDS = {"pc", "new_pc", "old_pc"}
 FLOAT_FIELDS = {"rate"}
 NUM_TRACK_SLOTS = 8
+# Matches SetAssociativeTable::kNoEvictionTag in src/token_engine.cpp --
+# "no real eviction happened" is never 0 (0 can be a real PC), it's
+# always all-ones for the engine's 64-bit Addr type.
+NO_EVICTION_TAG = (1 << 64) - 1
 
 
 def parse_line(line):
@@ -103,8 +107,8 @@ def build_dataset(events):
             if event == "alloc":
                 new_pc = ev["new_pc"]
                 sd.pc_changes.append({"decode": decode, "pc": pc_hex(new_pc)})
-                old_pc = ev.get("old_pc")  # absent when the way was simply free
-                if old_pc is not None:
+                old_pc = ev["old_pc"]
+                if old_pc != NO_EVICTION_TAG:
                     pc_to_train_slot.pop(old_pc, None)
                 pc_to_train_slot[new_pc] = slot
             elif event == "update":

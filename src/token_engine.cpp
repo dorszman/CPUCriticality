@@ -34,23 +34,19 @@ constexpr const char* kTraceLogPrefix = "@@ISQCRIT@@";
 // existing entry, i.e. a slot allocation -- always reported as
 // event=alloc, whether or not a prior occupant had to be evicted to
 // make room (true in steady state for essentially every allocation
-// past a table's initial fill); old_pc is simply omitted on the rare
-// case where the way was already free, rather than needing a separate
-// event type.
+// past a table's initial fill). old_pc is always printed -- it is
+// SetAssociativeTable::kNoEvictionTag (all-ones) when the way was
+// simply free (no real eviction), never 0, since 0 can be a real PC
+// (see kNoEvictionTag's own comment) and a log consumer has no other
+// way to tell the two apart.
 void TraceLogAcquire(bool enabled, const char* table, std::size_t index, bool wasHit,
-                      bool wasEviction, Addr evictedTag, Addr newPc, std::uint64_t decode) {
+                      Addr evictedTag, Addr newPc, std::uint64_t decode) {
     if (!enabled || wasHit) return;
-    if (wasEviction) {
-        std::printf("%s table=%s slot=%zu event=alloc old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
-                    kTraceLogPrefix, table, index,
-                    static_cast<unsigned long long>(evictedTag),
-                    static_cast<unsigned long long>(newPc),
-                    static_cast<unsigned long long>(decode));
-    } else {
-        std::printf("%s table=%s slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
-                    kTraceLogPrefix, table, index, static_cast<unsigned long long>(newPc),
-                    static_cast<unsigned long long>(decode));
-    }
+    std::printf("%s table=%s slot=%zu event=alloc old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
+                kTraceLogPrefix, table, index,
+                static_cast<unsigned long long>(evictedTag),
+                static_cast<unsigned long long>(newPc),
+                static_cast<unsigned long long>(decode));
 }
 
 // A PC-indexed, set-associative table shared by the training and
@@ -79,6 +75,15 @@ public:
     // fetch-group granularity instead of this fixed default.
     static constexpr unsigned kPcAlignmentShiftBits = 2;
 
+    // "No real eviction happened" sentinel for AcquireResult::evictedTag
+    // -- deliberately NOT 0: a host's real PC/tag space can plausibly
+    // include address 0 (a reset vector, a null-like sentinel address,
+    // whatever), so 0 cannot double as "no value" without an ambiguity
+    // a log consumer has no way to resolve. All-ones is not a
+    // physically addressable PC in any realistic tag width, so it's
+    // safe as an out-of-band marker.
+    static constexpr Addr kNoEvictionTag = std::numeric_limits<Addr>::max();
+
     // Physical slot index alongside the entry itself -- needed by
     // Impl's trace logging (see CriticalityConfig::enableTraceLog) to
     // identify which of a handful of tracked slots an event belongs to.
@@ -90,14 +95,12 @@ public:
 
     // Same idea for Acquire(): which physical slot was used, whether it
     // was already holding this same tag (a hit), and -- if not a hit --
-    // whether a DIFFERENT, still-valid tag had to be evicted to make
-    // room (as opposed to landing in a previously-free way), plus that
-    // evicted tag. evictedTag is only meaningful when wasEviction.
+    // the tag evicted to make room, or 0 if the way was simply free (no
+    // real eviction).
     struct AcquireResult {
         EntryT& entry;
         std::size_t index;
         bool wasHit;
-        bool wasEviction;
         Addr evictedTag;
     };
 
@@ -152,7 +155,7 @@ public:
             if (entries_[i].valid && entries_[i].tag == tag) {
                 lastTouched_[i] = ++setCounters_[set];
                 entries_[i].OnAccessed();
-                return AcquireResult{entries_[i], i, /*wasHit=*/true, /*wasEviction=*/false, Addr{0}};
+                return AcquireResult{entries_[i], i, /*wasHit=*/true, kNoEvictionTag};
             }
         }
         std::size_t victim = base;
@@ -165,8 +168,7 @@ public:
                 break;
             }
         }
-        bool wasEviction = false;
-        Addr evictedTag = 0;
+        Addr evictedTag = kNoEvictionTag; // stays the sentinel unless a real occupant is evicted below
         if (!foundFree) {
             // Victim choice depends on policy_ -- see LessEvictable.
             victim = base;
@@ -174,14 +176,13 @@ public:
                 std::size_t i = base + w;
                 if (LessEvictable(i, victim)) victim = i;
             }
-            wasEviction = true; // every way in this set is valid when !foundFree
-            evictedTag = entries_[victim].tag;
+            evictedTag = entries_[victim].tag; // every way in this set is valid when !foundFree
         }
         entries_[victim] = EntryT{};
         entries_[victim].valid = true;
         entries_[victim].tag = tag;
         lastTouched_[victim] = ++setCounters_[set];
-        return AcquireResult{entries_[victim], victim, /*wasHit=*/false, wasEviction, evictedTag};
+        return AcquireResult{entries_[victim], victim, /*wasHit=*/false, evictedTag};
     }
 
 private:
@@ -412,7 +413,7 @@ struct TokenEngine::Impl {
     void TrainOn(Addr pc, std::int64_t distance) {
         auto acq = trainTable.Acquire(pc);
         TrainEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog, "train", acq.index, acq.wasHit, acq.wasEviction,
+        TraceLogAcquire(cfg.enableTraceLog, "train", acq.index, acq.wasHit,
                         acq.evictedTag, pc, decodeCounter);
 
         if (distance <= cfg.criticalDistanceCycles) {
@@ -443,7 +444,7 @@ struct TokenEngine::Impl {
     void Promote(Addr pc, bool critical) {
         auto acq = predTable.Acquire(pc); // valid/tag already correct either way
         PredEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog, "pred", acq.index, acq.wasHit, acq.wasEviction,
+        TraceLogAcquire(cfg.enableTraceLog, "pred", acq.index, acq.wasHit,
                         acq.evictedTag, pc, decodeCounter);
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
