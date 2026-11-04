@@ -3,8 +3,8 @@
 **Audience:** this document is written to brief an engineer or AI coding agent
 well enough to implement the mechanism below inside a cycle-accurate (CA)
 out-of-order CPU performance model, and to extend/retarget the accompanying
-reference implementation (`include/token_engine.h`,
-`include/token.h`, `src/token_engine.cpp`, `src/token.cpp`) onto a
+reference implementation (`src/token_engine.h`,
+`src/token.h`, `src/token_engine.cpp`, `src/token.cpp`) onto a
 specific host simulator.
 
 **Status:** this is an architectural technique description (not RTL), meant
@@ -479,11 +479,11 @@ implementation above.
 
 ## 10. Implementation checklist
 
-- [x] `include/token.h` — `Token` (pool-allocated, refcounted) and
+- [x] `src/token.h` — `Token` (pool-allocated, refcounted) and
       `TokenRef` (RAII handle, meant to be embedded in the host's uop
       class) declarations.
-- [x] `src/token.cpp` — `Token::release()` / `Token::notifyExecuted()`.
-- [x] `include/token_engine.h` — public API, `CriticalityConfig`,
+- [x] `src/token.cpp` — `Token::Release()` / `Token::DoNotifyExecuted()`.
+- [x] `src/token_engine.h` — public API, `CriticalityConfig`,
       `TokenEngine` class declaration, `CriticalityStats`.
 - [x] `src/token_engine.cpp` — implementation of §3.1–§3.5 exactly
       as described above.

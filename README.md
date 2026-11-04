@@ -9,15 +9,15 @@ plain age-based ordering.
 - Full mechanism, data structures, pipeline integration points, and
   validation plan: [`docs/DESIGN.md`](docs/DESIGN.md)
 - Token API (pool-allocated, refcounted, embedded in your uop class):
-  [`include/token.h`](include/token.h) / [`src/token.cpp`](src/token.cpp)
-- Engine API: [`include/token_engine.h`](include/token_engine.h) /
+  [`src/token.h`](src/token.h) / [`src/token.cpp`](src/token.cpp)
+- Engine API: [`src/token_engine.h`](src/token_engine.h) /
   [`src/token_engine.cpp`](src/token_engine.cpp)
 - Minimal end-to-end usage / compile smoke test: [`examples/example_usage.cpp`](examples/example_usage.cpp)
 
 ## Build the example
 
 ```bash
-g++ -std=c++17 -Iinclude examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
+g++ -std=c++17 -Isrc examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
 ./example_usage
 ```
 

@@ -31,7 +31,7 @@
 // This is a compile/smoke test, not a real simulator integration -- see
 // docs/DESIGN.md S5 for the exact hook contract.
 //
-// Build: g++ -std=c++17 -Iinclude examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
+// Build: g++ -std=c++17 -Isrc examples/example_usage.cpp src/token_engine.cpp src/token.cpp -o example_usage
 
 #include "token_engine.h"
 
