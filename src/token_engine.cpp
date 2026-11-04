@@ -1,6 +1,7 @@
 #include "token_engine.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -22,6 +23,12 @@ constexpr std::int32_t ClampAdd(std::int32_t value, std::int32_t delta,
 void IncrementIfSet(StatCounter* counter) {
     if (counter) ++(*counter);
 }
+
+// Every CriticalityConfig::enableTraceLog line starts with this exact
+// token, deliberately unusual so a consumer (e.g. tools/visualize_trace.py)
+// can grep/filter it out of stdout unambiguously even when the host's
+// own logging is interleaved on the same stream.
+constexpr const char* kTraceLogPrefix = "@@ISQCRIT@@";
 
 // A PC-indexed, set-associative table shared by the training and
 // prediction tables. EntryT must have 'bool valid' and 'Addr tag'
@@ -49,6 +56,28 @@ public:
     // fetch-group granularity instead of this fixed default.
     static constexpr unsigned kPcAlignmentShiftBits = 2;
 
+    // Physical slot index alongside the entry itself -- needed by
+    // Impl's trace logging (see CriticalityConfig::enableTraceLog) to
+    // identify which of a handful of tracked slots an event belongs to.
+    // entry == nullptr on a miss; index is then meaningless.
+    struct FindResult {
+        const EntryT* entry;
+        std::size_t index;
+    };
+
+    // Same idea for Acquire(): which physical slot was used, whether it
+    // was already holding this same tag (a hit), and -- if not a hit --
+    // whether a DIFFERENT, still-valid tag had to be evicted to make
+    // room (as opposed to landing in a previously-free way), plus that
+    // evicted tag. evictedTag is only meaningful when wasEviction.
+    struct AcquireResult {
+        EntryT& entry;
+        std::size_t index;
+        bool wasHit;
+        bool wasEviction;
+        Addr evictedTag;
+    };
+
     void Configure(unsigned log2Sets, unsigned ways,
                    EvictionPolicy policy = EvictionPolicy::kDecayedPriorityThenLru,
                    std::uint64_t decayIdleUnit = 128) {
@@ -68,7 +97,7 @@ public:
     // otherwise-const operation, and the OnAccessed() callback (see
     // TrainEntry/PredEntry) that lets an entry type track its own notion
     // of "consulted," distinct from Acquire()'s "written."
-    const EntryT* Find(Addr tag) const {
+    FindResult Find(Addr tag) const {
         std::size_t set = SetIndex(tag);
         std::size_t base = set * ways_;
         for (unsigned w = 0; w < ways_; ++w) {
@@ -76,10 +105,10 @@ public:
             if (entries_[i].valid && entries_[i].tag == tag) {
                 lastTouched_[i] = ++setCounters_[set];
                 entries_[i].OnAccessed();
-                return &entries_[i];
+                return FindResult{&entries_[i], i};
             }
         }
-        return nullptr;
+        return FindResult{nullptr, 0};
     }
 
     // Returns the entry to write for 'tag': an existing match if one is
@@ -92,7 +121,7 @@ public:
     // fetch-time lookup the way the prediction table has); for the
     // prediction table this additionally fires on a re-promotion, a
     // comparatively rare event next to ordinary fetch-time Find() calls.
-    EntryT& Acquire(Addr tag) {
+    AcquireResult Acquire(Addr tag) {
         std::size_t set = SetIndex(tag);
         std::size_t base = set * ways_;
         for (unsigned w = 0; w < ways_; ++w) {
@@ -100,7 +129,7 @@ public:
             if (entries_[i].valid && entries_[i].tag == tag) {
                 lastTouched_[i] = ++setCounters_[set];
                 entries_[i].OnAccessed();
-                return entries_[i];
+                return AcquireResult{entries_[i], i, /*wasHit=*/true, /*wasEviction=*/false, Addr{0}};
             }
         }
         std::size_t victim = base;
@@ -113,6 +142,8 @@ public:
                 break;
             }
         }
+        bool wasEviction = false;
+        Addr evictedTag = 0;
         if (!foundFree) {
             // Victim choice depends on policy_ -- see LessEvictable.
             victim = base;
@@ -120,12 +151,14 @@ public:
                 std::size_t i = base + w;
                 if (LessEvictable(i, victim)) victim = i;
             }
+            wasEviction = true; // every way in this set is valid when !foundFree
+            evictedTag = entries_[victim].tag;
         }
         entries_[victim] = EntryT{};
         entries_[victim].valid = true;
         entries_[victim].tag = tag;
         lastTouched_[victim] = ++setCounters_[set];
-        return entries_[victim];
+        return AcquireResult{entries_[victim], victim, /*wasHit=*/false, wasEviction, evictedTag};
     }
 
 private:
@@ -354,7 +387,22 @@ struct TokenEngine::Impl {
     }
 
     void TrainOn(Addr pc, std::int64_t distance) {
-        TrainEntry& e = trainTable.Acquire(pc);
+        auto acq = trainTable.Acquire(pc);
+        TrainEntry& e = acq.entry;
+        if (cfg.enableTraceLog) {
+            if (acq.wasEviction) {
+                std::printf("%s table=train slot=%zu event=evict old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
+                            kTraceLogPrefix, acq.index,
+                            static_cast<unsigned long long>(acq.evictedTag),
+                            static_cast<unsigned long long>(pc),
+                            static_cast<unsigned long long>(decodeCounter));
+            } else if (!acq.wasHit) {
+                std::printf("%s table=train slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
+                            kTraceLogPrefix, acq.index, static_cast<unsigned long long>(pc),
+                            static_cast<unsigned long long>(decodeCounter));
+            }
+        }
+
         if (distance <= cfg.criticalDistanceCycles) {
             e.count = ClampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
         } else if (distance >= cfg.nonCriticalDistanceCycles) {
@@ -363,6 +411,11 @@ struct TokenEngine::Impl {
             return; // ambiguous zone: no update, no promotion check
         }
         IncrementIfSet(statPtrs.trainingEvents);
+        if (cfg.enableTraceLog) {
+            std::printf("%s table=train slot=%zu event=update pc=0x%llx count=%d decode=%llu\n",
+                        kTraceLogPrefix, acq.index, static_cast<unsigned long long>(pc), e.count,
+                        static_cast<unsigned long long>(decodeCounter));
+        }
 
         // promoteCriticalAtEffective == cfg.promoteCriticalAt whenever
         // the governor is disabled (never updated in that case) or the
@@ -376,17 +429,45 @@ struct TokenEngine::Impl {
     }
 
     void Promote(Addr pc, bool critical) {
-        PredEntry& e = predTable.Acquire(pc); // valid/tag already correct either way
+        auto acq = predTable.Acquire(pc); // valid/tag already correct either way
+        PredEntry& e = acq.entry;
+        if (cfg.enableTraceLog) {
+            if (acq.wasEviction) {
+                std::printf("%s table=pred slot=%zu event=evict old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
+                            kTraceLogPrefix, acq.index,
+                            static_cast<unsigned long long>(acq.evictedTag),
+                            static_cast<unsigned long long>(pc),
+                            static_cast<unsigned long long>(decodeCounter));
+            } else if (!acq.wasHit) {
+                std::printf("%s table=pred slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
+                            kTraceLogPrefix, acq.index, static_cast<unsigned long long>(pc),
+                            static_cast<unsigned long long>(decodeCounter));
+            }
+        }
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
         else IncrementIfSet(statPtrs.nonCriticalPromotions);
+        if (cfg.enableTraceLog) {
+            std::printf("%s table=pred slot=%zu event=%s pc=0x%llx hitCount=%u decode=%llu\n",
+                        kTraceLogPrefix, acq.index, critical ? "promote" : "demote",
+                        static_cast<unsigned long long>(pc), e.hitCount,
+                        static_cast<unsigned long long>(decodeCounter));
+        }
     }
 
     bool LookupPrediction(Addr pc) const {
-        const PredEntry* e = predTable.Find(pc);
-        bool critical = e ? e->critical : false; // unknown PC defaults to non-critical (baseline)
+        auto found = predTable.Find(pc);
+        bool critical = found.entry ? found.entry->critical : false; // unknown PC -> non-critical
         if (cfg.enableCriticalRateGovernor) {
             UpdateRateGovernor(critical);
+        }
+        if (cfg.enableTraceLog) {
+            std::printf("%s table=pred slot=%lld event=lookup pc=0x%llx critical=%d hitCount=%u decode=%llu\n",
+                        kTraceLogPrefix,
+                        found.entry ? static_cast<long long>(found.index) : -1LL,
+                        static_cast<unsigned long long>(pc), critical ? 1 : 0,
+                        found.entry ? found.entry->hitCount : 0u,
+                        static_cast<unsigned long long>(decodeCounter));
         }
         return critical;
     }
@@ -412,6 +493,7 @@ struct TokenEngine::Impl {
         if (rateWindowTotal < cfg.criticalRateControlInterval) return;
 
         double rate = static_cast<double>(rateWindowHits) / rateWindowTotal;
+        std::int32_t before = promoteCriticalAtEffective;
         if (rate > cfg.targetCriticalRate + cfg.criticalRateDeadband) {
             promoteCriticalAtEffective =
                 std::min(promoteCriticalAtEffective + 1, cfg.trainCounterMax);
@@ -426,6 +508,11 @@ struct TokenEngine::Impl {
             }
         } else {
             rateGoodWindowStreak = 0; // in the deadband: neutral, not "good"
+        }
+        if (cfg.enableTraceLog && promoteCriticalAtEffective != before) {
+            std::printf("%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
+                        kTraceLogPrefix, promoteCriticalAtEffective, rate,
+                        static_cast<unsigned long long>(decodeCounter));
         }
         rateWindowHits = 0;
         rateWindowTotal = 0;

@@ -207,6 +207,17 @@ struct CriticalityConfig {
     // correct in isolation. Must be >= 1 when
     // enableCriticalRateGovernor is true.
     std::uint32_t criticalRateRelaxDwellWindows = 4;
+
+    // Debugging/visualization aid only -- never enable in anything
+    // performance-sensitive. When true, every table allocation,
+    // eviction, promotion, demotion, prediction lookup, and governor
+    // threshold change is printed to stdout, one line each, every line
+    // starting with the exact token "@@ISQCRIT@@" so a log consumer
+    // (see tools/visualize_trace.py) can pull these lines out
+    // unambiguously even when the host's own stdout logging is
+    // interleaved on the same stream. Disabled by default; zero cost
+    // when disabled beyond the branch itself.
+    bool enableTraceLog = false;
 };
 
 // The counter width/type lives in exactly one place. Change it here (e.g.
