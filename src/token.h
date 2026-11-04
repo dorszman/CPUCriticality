@@ -41,7 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace cacrit {
+namespace ISQCrit {
 
 using InstrId = std::uint64_t;
 using Addr = std::uint64_t;
@@ -172,4 +172,4 @@ private:
     Epoch epoch_ = 0;
 };
 
-} // namespace cacrit
+} // namespace ISQCrit

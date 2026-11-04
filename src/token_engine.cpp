@@ -1,10 +1,11 @@
 #include "token_engine.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
-namespace cacrit {
+namespace ISQCrit {
 
 namespace {
 
@@ -22,6 +23,171 @@ void IncrementIfSet(StatCounter* counter) {
     if (counter) ++(*counter);
 }
 
+// A PC-indexed, set-associative table shared by the training and
+// prediction tables. EntryT must have 'bool valid' and 'Addr tag'
+// members (TrainEntry and PredEntry both do); whatever else it carries
+// is this table's payload.
+//
+// ways=1 reproduces the original direct-mapped design exactly: a single
+// candidate entry per set, no search, no replacement decision. ways>1
+// searches every way in the addressed set on each access and, when a
+// miss needs to allocate, prefers any invalid way before evicting the
+// least-recently-used valid one. This is what lets two PCs that happen
+// to hash to the same set coexist instead of unconditionally evicting
+// each other the way a direct-mapped table always would.
+//
+// Recency is tracked by a plain monotonic access counter (not wall
+// time), bumped on every hit AND every allocation -- not cycle-based,
+// since several lookups can legitimately happen within the same cycle
+// and still need a strict, unambiguous order for LRU to pick a victim
+// consistently.
+template <typename EntryT>
+class SetAssociativeTable {
+public:
+    // Assumes 4-byte-aligned (fixed-width RISC-style) instruction
+    // encoding; a real design should size/hash this to its own
+    // fetch-group granularity instead of this fixed default.
+    static constexpr unsigned kPcAlignmentShiftBits = 2;
+
+    void Configure(unsigned log2Sets, unsigned ways,
+                   EvictionPolicy policy = EvictionPolicy::kDecayedPriorityThenLru,
+                   std::uint64_t decayIdleUnit = 128) {
+        numSets_ = std::size_t{1} << log2Sets;
+        ways_ = ways;
+        policy_ = policy;
+        decayIdleUnit_ = decayIdleUnit;
+        entries_.assign(numSets_ * ways_, EntryT{});
+        lastTouched_.assign(numSets_ * ways_, 0);
+        setCounters_.assign(numSets_, 0);
+    }
+
+    // Read-only lookup: returns the matching entry, or nullptr on a
+    // miss. Never allocates. Still counts as an access for LRU/decay
+    // purposes on a hit (an ordinary cache semantic: reading an entry is
+    // still a use of it) -- hence the mutable recency bookkeeping on an
+    // otherwise-const operation, and the OnAccessed() callback (see
+    // TrainEntry/PredEntry) that lets an entry type track its own notion
+    // of "consulted," distinct from Acquire()'s "written."
+    const EntryT* Find(Addr tag) const {
+        std::size_t set = SetIndex(tag);
+        std::size_t base = set * ways_;
+        for (unsigned w = 0; w < ways_; ++w) {
+            std::size_t i = base + w;
+            if (entries_[i].valid && entries_[i].tag == tag) {
+                lastTouched_[i] = ++setCounters_[set];
+                entries_[i].OnAccessed();
+                return &entries_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    // Returns the entry to write for 'tag': an existing match if one is
+    // present (payload left untouched, caller updates it), otherwise a
+    // freshly allocated entry (valid=true, tag=tag, rest
+    // default-constructed) -- picking a free way in the set if one
+    // exists, else evicting the set's least-"useful" way. A HIT also
+    // calls OnAccessed(), same as Find() -- for the training table, each
+    // re-trained sample IS the "consulted" event (there is no separate
+    // fetch-time lookup the way the prediction table has); for the
+    // prediction table this additionally fires on a re-promotion, a
+    // comparatively rare event next to ordinary fetch-time Find() calls.
+    EntryT& Acquire(Addr tag) {
+        std::size_t set = SetIndex(tag);
+        std::size_t base = set * ways_;
+        for (unsigned w = 0; w < ways_; ++w) {
+            std::size_t i = base + w;
+            if (entries_[i].valid && entries_[i].tag == tag) {
+                lastTouched_[i] = ++setCounters_[set];
+                entries_[i].OnAccessed();
+                return entries_[i];
+            }
+        }
+        std::size_t victim = base;
+        bool foundFree = false;
+        for (unsigned w = 0; w < ways_; ++w) {
+            std::size_t i = base + w;
+            if (!entries_[i].valid) {
+                victim = i;
+                foundFree = true;
+                break;
+            }
+        }
+        if (!foundFree) {
+            // Victim choice depends on policy_ -- see LessEvictable.
+            victim = base;
+            for (unsigned w = 1; w < ways_; ++w) {
+                std::size_t i = base + w;
+                if (LessEvictable(i, victim)) victim = i;
+            }
+        }
+        entries_[victim] = EntryT{};
+        entries_[victim].valid = true;
+        entries_[victim].tag = tag;
+        lastTouched_[victim] = ++setCounters_[set];
+        return entries_[victim];
+    }
+
+private:
+    std::size_t SetIndex(Addr tag) const {
+        return static_cast<std::size_t>((tag >> kPcAlignmentShiftBits) & (numSets_ - 1));
+    }
+
+    // EntryT::EvictionPriority() after applying staleness decay: halved
+    // for each doubling of decayIdleUnit_-sized idle blocks THIS SET has
+    // seen since entry 'i' was last touched (idle < decayIdleUnit_ -> no
+    // decay at all; idle in [decayIdleUnit_, 2*decayIdleUnit_) -> one
+    // halving; next doubling -> two; ...). Measuring idle time per-set
+    // rather than table-wide is what keeps this self-scaling with a
+    // single fixed rate (contention for a busy set decays faster, a
+    // quiet set barely decays at all) -- decayIdleUnit_ is the one
+    // knob the formula is built around (see
+    // CriticalityConfig::decayIdleUnit). Only called by the two policies
+    // that use it; kLru never reaches this.
+    std::int64_t DecayedPriority(std::size_t i, std::size_t set) const {
+        std::int64_t raw = entries_[i].EvictionPriority();
+        if (raw <= 0) return raw;
+        std::uint64_t idle = setCounters_[set] - lastTouched_[i];
+        std::uint64_t units = idle / decayIdleUnit_;
+        if (units == 0) return raw;
+        unsigned halvings = 0;
+        for (std::uint64_t t = units; t > 0; t >>= 1) ++halvings;
+        return raw >> halvings;
+    }
+
+    // True if way 'a' should be evicted before way 'b'. Both must be in
+    // the same set (the only way this is ever called). Branches on
+    // policy_ -- the three EvictionPolicy values are mutually exclusive,
+    // non-overlapping victim-selection rules, not layered on each other.
+    bool LessEvictable(std::size_t a, std::size_t b) const {
+        std::size_t set = a / ways_;
+        switch (policy_) {
+            case EvictionPolicy::kLru:
+                return lastTouched_[a] < lastTouched_[b];
+            case EvictionPolicy::kDecayedHitCount:
+                // No recency tiebreak at all, by design: a tie here
+                // just keeps whichever way LessEvictable was called
+                // with first (fixed way order), never lastTouched_.
+                return DecayedPriority(a, set) < DecayedPriority(b, set);
+            case EvictionPolicy::kDecayedPriorityThenLru:
+            default: {
+                std::int64_t pa = DecayedPriority(a, set);
+                std::int64_t pb = DecayedPriority(b, set);
+                if (pa != pb) return pa < pb;
+                return lastTouched_[a] < lastTouched_[b];
+            }
+        }
+    }
+
+    std::vector<EntryT> entries_;
+    mutable std::vector<std::uint64_t> lastTouched_;
+    mutable std::vector<std::uint64_t> setCounters_; // one per set, not table-wide
+    EvictionPolicy policy_ = EvictionPolicy::kDecayedPriorityThenLru;
+    std::uint64_t decayIdleUnit_ = 128;
+    std::size_t numSets_ = 1;
+    unsigned ways_ = 1;
+};
+
 } // namespace
 
 struct TokenEngine::Impl {
@@ -33,6 +199,18 @@ struct TokenEngine::Impl {
         if (cfg.tokenAssignInterval == 0) {
             throw std::invalid_argument("CriticalityConfig::tokenAssignInterval must be >= 1");
         }
+        if (cfg.trainingTableWays == 0) {
+            throw std::invalid_argument("CriticalityConfig::trainingTableWays must be >= 1");
+        }
+        if (cfg.predictionTableWays == 0) {
+            throw std::invalid_argument("CriticalityConfig::predictionTableWays must be >= 1");
+        }
+        if (cfg.trainingTableDecayIdleUnit == 0) {
+            throw std::invalid_argument("CriticalityConfig::trainingTableDecayIdleUnit must be >= 1");
+        }
+        if (cfg.predictionTableDecayIdleUnit == 0) {
+            throw std::invalid_argument("CriticalityConfig::predictionTableDecayIdleUnit must be >= 1");
+        }
 
         tokenPool.resize(cfg.tokenPoolSize);
         freeList.reserve(cfg.tokenPoolSize);
@@ -42,8 +220,10 @@ struct TokenEngine::Impl {
             freeList.push_back(tokenPool.size() - 1 - i); // order doesn't matter
         }
 
-        trainTable.resize(std::size_t{1} << cfg.trainingTableEntriesLog2);
-        predTable.resize(std::size_t{1} << cfg.predictionTableEntriesLog2);
+        trainTable.Configure(cfg.trainingTableEntriesLog2, cfg.trainingTableWays,
+                              cfg.trainingTableEvictionPolicy, cfg.trainingTableDecayIdleUnit);
+        predTable.Configure(cfg.predictionTableEntriesLog2, cfg.predictionTableWays,
+                             cfg.predictionTableEvictionPolicy, cfg.predictionTableDecayIdleUnit);
     }
 
     // --- Token pool ------------------------------------------------------
@@ -54,31 +234,61 @@ struct TokenEngine::Impl {
     struct TrainEntry {
         bool valid = false;
         Addr tag = 0;
-        std::int32_t count = 0;
+        std::int32_t count = 0; // directional confidence, unrelated to eviction
+
+        // How many times this PC has actually been (re)trained (an
+        // Acquire() hit) since this entry was last allocated -- the
+        // training table's own "usefulness" signal, independent of
+        // 'count' (which tracks DIRECTION -- critical vs not -- and
+        // saturates quickly, so it can't distinguish a PC trained once
+        // from one trained fifty times). Only consulted when
+        // trainingTableEvictionPolicy == kDecayedHitCount; kLru ignores
+        // this field entirely. mutable for the same reason
+        // PredEntry::hitCount is: Acquire()'s hit path calls
+        // OnAccessed() on what is otherwise a payload write, because for
+        // this table a (re)training sample IS the "was this used" event.
+        mutable std::uint32_t hitCount = 0;
+
+        std::int64_t EvictionPriority() const { return static_cast<std::int64_t>(hitCount); }
+        void OnAccessed() const {
+            if (hitCount < std::numeric_limits<std::uint32_t>::max()) ++hitCount;
+        }
     };
     struct PredEntry {
         bool valid = false;
         Addr tag = 0;
         bool critical = false;
+
+        // How many times this prediction has actually been consulted
+        // (via Find() -- i.e. IsPredictedCritical(), a real fetch-time
+        // lookup) since it was last (re)promoted. This is the
+        // "usefulness" signal the training table has no equivalent of:
+        // a prediction leaned on heavily is worth protecting even if a
+        // colliding PC was touched more recently -- SetAssociativeTable
+        // additionally decays this by how idle the entry's own SET has
+        // been (see DecayedPriority), so heavy-but-old usage doesn't
+        // earn permanent protection once it's no longer relevant.
+        //
+        // mutable: Find() is logically read-only from the caller's
+        // perspective (it's a lookup, not a write), but reading a
+        // prediction is itself the event that makes it "used" -- the
+        // same justification SetAssociativeTable already uses for its
+        // own lastTouched_/accessCounter_ bookkeeping.
+        mutable std::uint32_t hitCount = 0;
+
+        std::int64_t EvictionPriority() const { return static_cast<std::int64_t>(hitCount); }
+        void OnAccessed() const {
+            if (hitCount < std::numeric_limits<std::uint32_t>::max()) ++hitCount;
+        }
     };
-    std::vector<TrainEntry> trainTable;
-    std::vector<PredEntry> predTable;
+    SetAssociativeTable<TrainEntry> trainTable;
+    SetAssociativeTable<PredEntry> predTable;
 
     CriticalityConfig cfg;
     TokenEngine* self;
     CriticalityStatPointers statPtrs; // all null until SetupStats() is called
     std::uint64_t decodeCounter = 0;
     Cycle currentCycle = 0;
-
-    // Assumes 4-byte-aligned (fixed-width RISC-style) instruction
-    // encoding; a real design should size/hash this to its own
-    // fetch-group granularity instead of this fixed default.
-    static constexpr unsigned kPcAlignmentShiftBits = 2;
-
-    std::size_t IndexFor(Addr pc, unsigned log2Entries) const {
-        return static_cast<std::size_t>((pc >> kPcAlignmentShiftBits) &
-                                         ((std::uint64_t{1} << log2Entries) - 1));
-    }
 
     // Called once per decoded uop, unconditionally. Always advances the
     // sampling counter first (so it tracks decoded uops, not granted
@@ -115,13 +325,7 @@ struct TokenEngine::Impl {
     }
 
     void TrainOn(Addr pc, std::int64_t distance) {
-        std::size_t idx = IndexFor(pc, cfg.trainingTableEntriesLog2);
-        TrainEntry& e = trainTable[idx];
-        if (!e.valid || e.tag != pc) {
-            e.valid = true;
-            e.tag = pc;
-            e.count = 0;
-        }
+        TrainEntry& e = trainTable.Acquire(pc);
         if (distance <= cfg.criticalDistanceCycles) {
             e.count = ClampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
         } else if (distance >= cfg.nonCriticalDistanceCycles) {
@@ -139,20 +343,15 @@ struct TokenEngine::Impl {
     }
 
     void Promote(Addr pc, bool critical) {
-        std::size_t idx = IndexFor(pc, cfg.predictionTableEntriesLog2);
-        PredEntry& e = predTable[idx];
-        e.valid = true;
-        e.tag = pc;
+        PredEntry& e = predTable.Acquire(pc); // valid/tag already correct either way
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
         else IncrementIfSet(statPtrs.nonCriticalPromotions);
     }
 
     bool LookupPrediction(Addr pc) const {
-        std::size_t idx = IndexFor(pc, cfg.predictionTableEntriesLog2);
-        const PredEntry& e = predTable[idx];
-        if (e.valid && e.tag == pc) return e.critical;
-        return false; // unknown PC defaults to non-critical (baseline behavior)
+        const PredEntry* e = predTable.Find(pc);
+        return e ? e->critical : false; // unknown PC defaults to non-critical (baseline behavior)
     }
 
     // Returns a slot to the pool and bumps its epoch, regardless of WHY
@@ -242,4 +441,4 @@ void TokenEngine::TokenExpire(Token* token) {
     impl_->TokenExpire(token);
 }
 
-} // namespace cacrit
+} // namespace ISQCrit

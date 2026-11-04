@@ -24,7 +24,7 @@ g++ -std=c++17 -Isrc examples/example_usage.cpp src/token_engine.cpp src/token.c
 ## Integrating into an existing performance model
 
 The module is simulator-agnostic (C++17, standard library only). A host
-model embeds a `cacrit::TokenRef` as a plain member of its own uop/
+model embeds a `ISQCrit::TokenRef` as a plain member of its own uop/
 micro-op class, calls `TokenEngine::Tick` once per cycle, and wires in
 `TokenEngine::DecodeGetToken` (called unconditionally, once per decoded
 uop) and `TokenRef::NotifyExecuted` at execute. There is no execute/rename/flush

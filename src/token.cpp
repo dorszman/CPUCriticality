@@ -1,7 +1,7 @@
 #include "token.h"
 #include "token_engine.h"
 
-namespace cacrit {
+namespace ISQCrit {
 
 void Token::Release() {
     if (refcount_ == 0) return; // defensive; should not happen
@@ -15,4 +15,4 @@ bool Token::DoNotifyExecuted() {
     return engine_->UpdateCriticality(this);
 }
 
-} // namespace cacrit
+} // namespace ISQCrit

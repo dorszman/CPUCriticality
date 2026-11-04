@@ -19,7 +19,35 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace cacrit {
+namespace ISQCrit {
+
+// How a set-associative table picks a victim once a set is full. Shared
+// by the training and prediction tables, though only the training
+// table's choice is exposed as a config knob (see
+// CriticalityConfig::trainingTableEvictionPolicy below) -- the
+// prediction table's policy is fixed, already validated, and not
+// something this project currently has evidence to make configurable.
+enum class EvictionPolicy {
+    // Pure least-recently-used: whichever way in the set was touched
+    // longest ago loses, full stop. Ignores any confidence/frequency
+    // signal an entry may carry. The simplest, safest choice -- no
+    // staleness math, nothing to calibrate.
+    kLru,
+
+    // Evict by lowest decayed access-frequency counter (see
+    // DecayedPriority in token_engine.cpp), with NO recency tiebreak at
+    // all -- ties are broken by fixed way order, not by lastTouched_.
+    // Protects frequently-(re)trained entries from eviction by a
+    // merely-more-recent one-off, but a long-idle entry's advantage
+    // still erodes on its own as ITS set sees more traffic, so nothing
+    // earns permanent protection.
+    kDecayedHitCount,
+
+    // Decayed priority first, least-recently-used only as a tiebreak
+    // among exactly equal (decayed) priorities. The prediction table's
+    // fixed policy; also selectable for the training table if wanted.
+    kDecayedPriorityThenLru,
+};
 
 struct CriticalityConfig {
     // Number of simultaneously in-flight tokens. Small by design: this
@@ -28,10 +56,49 @@ struct CriticalityConfig {
     // std::invalid_argument if it is 0.
     unsigned tokenPoolSize = 8;
 
-    // log2 of the number of entries in the training table and prediction
-    // table (both direct-mapped, PC-indexed).
+    // log2 of the number of SETS in the training table and prediction
+    // table (both PC-indexed). Total entries per table = (1 <<
+    // ...Log2) * ...Ways.
     unsigned trainingTableEntriesLog2 = 10;
     unsigned predictionTableEntriesLog2 = 10;
+
+    // Ways per set. 1 (the default) reproduces the original direct-mapped
+    // design exactly: two PCs that hash to the same set unconditionally
+    // evict each other. >1 adds associativity -- both PCs can coexist in
+    // the same set (up to 'ways' of them) instead of aliasing, at the
+    // cost of searching every way on each lookup and needing a
+    // replacement policy (LRU within the set) once a set is full. Must
+    // be >= 1 -- TokenEngine's constructor throws std::invalid_argument
+    // if either is 0.
+    unsigned trainingTableWays = 1;
+    unsigned predictionTableWays = 1;
+
+    // Which policy the training table uses to pick a victim once a set
+    // is full (only matters when trainingTableWays > 1 and a set is
+    // actually full). A deliberate either/or choice between two
+    // well-understood, non-overlapping policies -- not a numeric
+    // threshold to calibrate. Defaults to the simplest option.
+    EvictionPolicy trainingTableEvictionPolicy = EvictionPolicy::kLru;
+
+    // Same choice, for the prediction table (only matters when
+    // predictionTableWays > 1). Defaults to kDecayedPriorityThenLru --
+    // consulted heavily via IsPredictedCritical() on every fetch, so
+    // unlike the training table, decayed usefulness (with LRU only as a
+    // tiebreak) rather than plain LRU is the validated starting point
+    // here.
+    EvictionPolicy predictionTableEvictionPolicy = EvictionPolicy::kDecayedPriorityThenLru;
+
+    // How many idle accesses to an entry's own set correspond to one
+    // halving of its eviction priority, for each table's decay-based
+    // policy (training table: only when trainingTableEvictionPolicy ==
+    // kDecayedHitCount; prediction table: always, its policy is fixed
+    // at kDecayedPriorityThenLru). Below this many idle accesses, an
+    // entry hasn't decayed at all. Separate per table since the two
+    // tables typically see very different access patterns/contention.
+    // Both must be >= 1 -- TokenEngine's constructor throws
+    // std::invalid_argument if either is 0 (used as a divisor).
+    std::uint64_t trainingTableDecayIdleUnit = 128;
+    std::uint64_t predictionTableDecayIdleUnit = 128;
 
     // Default sampling policy (matches the original mechanism): a token
     // is assigned on average once every tokenAssignInterval decoded
@@ -181,4 +248,4 @@ private:
     Impl* impl_;
 };
 
-} // namespace cacrit
+} // namespace ISQCrit

@@ -215,11 +215,35 @@ executing, the mechanism is the same underlying helper
 directly from `TokenEngine::UpdateCriticality` (measurement closed) — see
 §8.
 
-### 3.4 Training table (PC-indexed, saturating counter)
+### 3.4 Training table (PC-indexed, saturating counter, set-associative)
 
 - Indexed by the *producer's* PC (same indexing scheme as an instruction
   cache lookup, so it can be probed in parallel with fetch with no added
-  latency on the critical fetch path).
+  latency on the critical fetch path). `trainingTableWays` (default 1,
+  i.e. direct-mapped) controls how many candidate entries share each
+  set: with `ways = 1`, two PCs that hash to the same set unconditionally
+  evict each other; `ways > 1` lets up to `ways` such PCs coexist,
+  searching every way in the set on each access.
+- When `ways > 1` and a set is full, which entry is evicted is governed
+  by `trainingTableEvictionPolicy` — a deliberate either/or choice
+  between two complete, non-overlapping policies (not a numeric
+  threshold to calibrate):
+  - `kLru` (the default): plain least-recently-used. Whichever entry in
+    the set was touched longest ago is evicted, full stop, ignoring how
+    much training evidence it has accumulated.
+  - `kDecayedHitCount`: evict by lowest decayed hit-count instead, with
+    **no** recency tiebreak at all. Each `TrainEntry` carries its own
+    `hitCount` — bumped every time it is re-trained (independent of
+    `count`, which tracks *direction*, critical vs. non-critical, and
+    saturates quickly; `hitCount` tracks sheer *frequency* and does
+    not). This protects a PC that's been trained many times from being
+    evicted by a PC that merely happens to have been touched more
+    recently. The protection isn't permanent, though: `hitCount` is
+    discounted by how idle the entry's own *set* has been since it was
+    last touched (see the decay formula under §3.5 — the exact same
+    mechanism, just also offered here, governed by its own
+    `trainingTableDecayIdleUnit` knob, independent of the prediction
+    table's).
 - On each distance measurement:
   - `distance <= criticalDistanceCycles` → increment the counter (evidence
     toward "critical").
@@ -232,11 +256,43 @@ directly from `TokenEngine::UpdateCriticality` (measurement closed) — see
   across many dynamic instances of the same static instruction before
   committing — exactly like a 2-bit branch-history counter.
 
-### 3.5 Prediction table (PC-indexed, 1 bit)
+### 3.5 Prediction table (PC-indexed, 1 bit, set-associative)
 
 - When a training counter crosses a promotion threshold in either
   direction, write a 1-bit critical/non-critical verdict into the
-  prediction table, indexed the same way.
+  prediction table, indexed the same way. `predictionTableWays` (default
+  1) controls its associativity independently of the training table's.
+- Same kind of choice as the training table, via its own
+  `predictionTableEvictionPolicy` (only matters when
+  `predictionTableWays > 1`), defaulting to `kDecayedPriorityThenLru`
+  rather than `kLru` — this table is consulted on every single fetch via
+  `IsPredictedCritical()`, so the validated starting point here leans on
+  that signal instead of plain recency. Each `PredEntry` carries a
+  `hitCount`, bumped every time it's actually consulted (the genuine
+  "usefulness" signal here, since there is no per-entry confidence
+  counter the way the training table has). Under the default policy, a
+  miss that needs to allocate within a full set evicts the lowest
+  **decayed** `hitCount` first, with recency only as the tiebreak among
+  equal decayed values (`kLru` and `kDecayedHitCount` behave exactly as
+  described in §3.4, just against `hitCount` instead of the training
+  table's own counter). The decay: an entry's raw
+  `hitCount` is right-shifted once for each doubling of
+  `idle / predictionTableDecayIdleUnit` (integer division — below
+  `predictionTableDecayIdleUnit` idle accesses, no decay at all), where
+  `idle` is how many accesses *that entry's own set* has seen since it
+  was last touched — not a table-wide counter, which would make the
+  decay rate secretly depend on overall table traffic, and
+  `predictionTableDecayIdleUnit` (`CriticalityConfig`, default `128`,
+  must be >= 1) is the one rate knob this table's decay is built around:
+  it sets how many idle accesses correspond to one halving. The training
+  table has its own separate `trainingTableDecayIdleUnit` for the same
+  formula, independently tunable since the two tables typically see very
+  different access patterns. Measuring idle time per-set keeps the
+  *onset* self-scaling with actual contention for that set even though
+  the rate itself is configurable: a heavily-consulted-but-now-stale
+  entry's advantage still erodes on its own as its set sees more
+  activity, rather than earning permanent protection — the knob only
+  tunes how fast that erosion happens.
 - This table is what the front end actually consults: read in parallel with
   the instruction cache on every fetch, so by the time an instruction
   reaches the issue queue it already carries a predicted-critical tag with
@@ -283,9 +339,10 @@ since it was part of the original idea): on a cache miss caused by a
 *non-critical* load, mask cache lines belonging to predicted-critical
 instructions from eviction, so non-critical traffic cannot evict data the
 predicted-critical path depends on. Critical-load misses use the ordinary
-replacement policy unmodified. This only needs one more
-`isPredictedCriticalForEviction(pc)` query at the cache controller; the
-training/prediction tables are unchanged and shared.
+replacement policy unmodified. This only needs the cache controller
+querying `IsPredictedCritical(pc)` same as the issue-queue scheduler does;
+the training/prediction tables are unchanged and shared — no separate
+eviction-specific query is needed.
 
 ---
 
@@ -295,13 +352,22 @@ training/prediction tables are unchanged and shared.
 |---|---|---|
 | `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `epoch_` (bumped every time the slot returns to the pool, for any reason), `pc_` (fixed at creation), `state_` (`Invalid` / `PendingProducerExe` / `PendingConsumerExe`), `producerWbTime_` (valid once `state_ == PendingConsumerExe`), `poolIndex_` | 8 entries (3-bit token id) |
 | `TokenRef` | a single `Token*`; held as a plain member of the host's uop class — never tracked by the engine itself | one per uop, usually null |
-| Training table entry | `valid`, `tag (PC)`, `count` (signed, saturating) | 1024 entries, direct-mapped |
-| Prediction table entry | `valid`, `tag (PC)`, `critical` (1 bit) | 1024 entries, direct-mapped |
+| Training table entry | `valid`, `tag (PC)`, `count` (signed, saturating), `hitCount` (unsigned, only meaningful under `kDecayedHitCount`) | 1024 sets × `trainingTableWays` (default 1) |
+| Prediction table entry | `valid`, `tag (PC)`, `critical` (1 bit), `hitCount` (unsigned) | 1024 sets × `predictionTableWays` (default 1) |
 
-Direct-mapped, PC-truncated-tag tables are the cheap realistic choice for
-both training and prediction tables; the reference implementation stores
-full PCs for simplicity/correctness in a functional model and notes where a
-real design would truncate tag bits to save area. There is no register
+Both tables are `SetAssociativeTable<EntryT>` (see §3.4/§3.5): PC-indexed
+into a set, then every way within that set searched on access. Eviction
+policy is an explicit, independently host-configurable `EvictionPolicy`
+choice per table (`kLru` / `kDecayedHitCount` / `kDecayedPriorityThenLru`)
+rather than one fixed mechanism — `trainingTableEvictionPolicy` (default
+`kLru`) for the training table, `predictionTableEvictionPolicy` (default
+`kDecayedPriorityThenLru`) for the prediction table. The default `ways = 1` for both
+reproduces a plain direct-mapped table exactly regardless of policy (no
+search, no eviction decision ever needed — the original design).
+PC-truncated tags are the cheap realistic choice for a real
+implementation; this reference implementation stores full PCs for
+simplicity/correctness in a functional model and notes where a real
+design would truncate tag bits to save area. There is no register
 scoreboard table and no dependency bookkeeping structure at all (see
 §3.2) — hand-off rides directly on the host's own issue-queue wakeup
 logic instead of any shadow structure this module would otherwise have to
@@ -318,7 +384,7 @@ host model's own uop/micro-op class must embed one plain member:
 #include "token.h"
 struct Uop {
     /* ... host's own fields ... */
-    cacrit::TokenRef token; // empty (invalid) on almost every uop
+    ISQCrit::TokenRef token; // empty (invalid) on almost every uop
 };
 ```
 
@@ -395,6 +461,28 @@ against your workload mix:
 - `trainCounterMin/Max`, `promoteCriticalAt/NonCriticalAt`: hysteresis depth
   before a prediction flips; deeper hysteresis = more stable but slower to
   adapt to phase changes.
+- `trainingTableWays` / `predictionTableWays`: associativity of each table
+  (default 1 = direct-mapped, matching the original design). Raise either
+  if your workload has PCs that collide at the same set and alias each
+  other's trained state away — the cost is a linear search across `ways`
+  entries on every table access, and `ways` recency/priority comparisons
+  on an eviction.
+- `trainingTableEvictionPolicy` / `predictionTableEvictionPolicy`:
+  independent per-table choice of `kLru`, `kDecayedHitCount`, or
+  `kDecayedPriorityThenLru` (see §3.4/§3.5). Training table defaults to
+  `kLru` (simplest, nothing to calibrate); prediction table defaults to
+  `kDecayedPriorityThenLru` (the validated starting point, since it's
+  consulted on every fetch). The decayed options cost a per-entry
+  counter and the decay formula below. Only matters when the
+  corresponding table's `...Ways > 1`.
+- `trainingTableDecayIdleUnit` / `predictionTableDecayIdleUnit` (default
+  `128` each, independent of each other): how many idle accesses to an
+  entry's own set correspond to one halving of its decayed eviction
+  priority, for whichever decayed policy each table is actually using.
+  Smaller = faster-decaying, more volatile protection; larger = slower
+  decay, closer to no staleness consideration at all. Each one only
+  matters when its own table's `...EvictionPolicy` is `kDecayedHitCount`
+  or `kDecayedPriorityThenLru`.
 
 ---
 
