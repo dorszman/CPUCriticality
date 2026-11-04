@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Turns a CriticalityConfig::enableTraceLog log into an interactive HTML
-visualization of training-table and prediction-table behavior over time.
+"""Turns a CriticalityConfig::enableTraceLog log into an interactive
+matplotlib window showing training-table and prediction-table behavior
+over time -- a native plot window (TkAgg), not a browser page: use the
+toolbar's pan/zoom-to-box/home buttons to navigate, and the per-table
+radio buttons to switch which of the 8 tracked slots is shown.
 
 The log may be mixed with other, unrelated stdout output -- every line
 this engine emits starts with the exact token "@@ISQCRIT@@" (see
@@ -8,14 +11,16 @@ kTraceLogPrefix in src/token_engine.cpp), so this script only ever looks
 at lines containing that token and ignores everything else.
 
 Usage:
-    python3 tools/visualize_trace.py <logfile> [output.html]
+    python3 tools/visualize_trace.py <logfile>
 
 Generate a log with tools/trace_demo.cpp:
     g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/token.cpp -o trace_demo
     ./trace_demo > /tmp/trace.log
-    python3 tools/visualize_trace.py /tmp/trace.log trace.html
+    python3 tools/visualize_trace.py /tmp/trace.log
+
+Requires matplotlib with an interactive backend (e.g. `apt install
+python3-matplotlib python3-tk` on Debian/Ubuntu).
 """
-import json
 import re
 import sys
 
@@ -60,20 +65,20 @@ class SlotData:
     cumulative promote/demote counters."""
 
     def __init__(self):
-        # value series: list of {x: decode, y: value}
+        # value series: list of (x, y) pairs
         self.count_series = []       # training table only
         self.critical_series = []    # prediction table only (0/1)
         self.hitcount_series = []    # prediction table only
         self.promote_cum = []        # cumulative count, step series
         self.demote_cum = []
-        self.pc_changes = []         # [{decode, pc}] for each alloc event
+        self.pc_changes = []         # [(decode, pc_str)] for each alloc event
 
 
 def build_dataset(events):
     train_slots = {i: SlotData() for i in range(NUM_TRACK_SLOTS)}
     pred_slots = {i: SlotData() for i in range(NUM_TRACK_SLOTS)}
-    effective_series = []    # global: [{x: decode, y: value}]
-    critical_ratio_series = []  # global: [{x: decode, y: ratio}]
+    effective_series = []       # global: [(x, y)]
+    critical_ratio_series = []  # global: [(x, y)]
 
     train_promote_cum = {i: 0 for i in range(NUM_TRACK_SLOTS)}
     train_demote_cum = {i: 0 for i in range(NUM_TRACK_SLOTS)}
@@ -96,7 +101,7 @@ def build_dataset(events):
         decode = ev.get("decode")
 
         if table == "train" and event == "effective_change":
-            effective_series.append({"x": decode, "y": ev["value"]})
+            effective_series.append((decode, ev["value"]))
             continue
 
         if table == "train":
@@ -106,53 +111,47 @@ def build_dataset(events):
             sd = train_slots[slot]
             if event == "alloc":
                 new_pc = ev["new_pc"]
-                sd.pc_changes.append({"decode": decode, "pc": pc_hex(new_pc)})
+                sd.pc_changes.append((decode, pc_hex(new_pc)))
                 old_pc = ev["old_pc"]
                 if old_pc != NO_EVICTION_TAG:
                     pc_to_train_slot.pop(old_pc, None)
                 pc_to_train_slot[new_pc] = slot
             elif event == "update":
-                sd.count_series.append({"x": decode, "y": ev["count"]})
+                sd.count_series.append((decode, ev["count"]))
 
         elif table == "pred":
             if event == "lookup":
                 total_lookups += 1
                 if ev.get("critical"):
                     total_critical += 1
-                critical_ratio_series.append(
-                    {"x": decode, "y": total_critical / total_lookups}
-                )
+                critical_ratio_series.append((decode, total_critical / total_lookups))
                 slot = ev.get("slot")
                 if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                     sd = pred_slots[slot]
-                    sd.critical_series.append({"x": decode, "y": ev["critical"]})
-                    sd.hitcount_series.append({"x": decode, "y": ev["hitCount"]})
+                    sd.critical_series.append((decode, ev["critical"]))
+                    sd.hitcount_series.append((decode, ev["hitCount"]))
                 continue
 
             if event == "alloc":
                 slot = ev.get("slot")
                 if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
-                    pred_slots[slot].pc_changes.append(
-                        {"decode": decode, "pc": pc_hex(ev["new_pc"])}
-                    )
+                    pred_slots[slot].pc_changes.append((decode, pc_hex(ev["new_pc"])))
             elif event in ("promote", "demote"):
                 slot = ev.get("slot")
                 if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                     sd = pred_slots[slot]
-                    sd.critical_series.append(
-                        {"x": decode, "y": 1 if event == "promote" else 0}
-                    )
-                    sd.hitcount_series.append({"x": decode, "y": ev["hitCount"]})
+                    sd.critical_series.append((decode, 1 if event == "promote" else 0))
+                    sd.hitcount_series.append((decode, ev["hitCount"]))
 
                 train_slot = pc_to_train_slot.get(ev["pc"])
                 if train_slot is not None:
                     tsd = train_slots[train_slot]
                     if event == "promote":
                         train_promote_cum[train_slot] += 1
-                        tsd.promote_cum.append({"x": decode, "y": train_promote_cum[train_slot]})
+                        tsd.promote_cum.append((decode, train_promote_cum[train_slot]))
                     else:
                         train_demote_cum[train_slot] += 1
-                        tsd.demote_cum.append({"x": decode, "y": train_demote_cum[train_slot]})
+                        tsd.demote_cum.append((decode, train_demote_cum[train_slot]))
 
     return {
         "train_slots": train_slots,
@@ -162,193 +161,100 @@ def build_dataset(events):
     }
 
 
-PAGE_TEMPLATE = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Criticality predictor trace</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>
-<style>
-  :root { --bg: #0f1115; --panel: #1a1d24; --text: #e6e6e6; --accent: #4fc3f7;
-          --grid: #2a2e38; --promote: #66bb6a; --demote: #ef5350; --marker: #ffa726; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-         margin: 0; padding: 16px; }
-  h1 { font-size: 18px; margin: 0 0 4px 0; }
-  .sub { color: #9aa0ac; font-size: 12px; margin-bottom: 16px; }
-  .half { background: var(--panel); border-radius: 10px; padding: 12px; margin-bottom: 16px; }
-  .half h2 { margin: 0 0 8px 0; font-size: 15px; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-  .tab-btn { background: #262b35; color: var(--text); border: 1px solid var(--grid);
-             border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
-  .tab-btn.active { background: var(--accent); color: #06232b; font-weight: 600; }
-  .chart-wrap { position: relative; height: 320px; }
-  .legend-note { color: #9aa0ac; font-size: 11px; margin-top: 6px; }
-  .zoom-hint { color: #9aa0ac; font-size: 11px; }
-  .reset-btn { background: #262b35; color: var(--text); border: 1px solid var(--grid);
-               border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px;
-               margin-left: 10px; }
-  .chart-toolbar { display: flex; align-items: center; margin-bottom: 6px; }
-</style>
-</head>
-<body>
-<h1>Criticality predictor trace</h1>
-<div class="sub">X axis: cumulative decoded instructions. Dashed vertical lines mark a slot's occupant PC changing (allocation, evicting any prior occupant).</div>
+def _xy(series):
+    if not series:
+        return [], []
+    xs, ys = zip(*series)
+    return list(xs), list(ys)
 
-<div class="half">
-  <h2>Training table (8 tracked slots)</h2>
-  <div class="tabs" id="train-tabs"></div>
-  <div class="chart-toolbar">
-    <span class="zoom-hint">Scroll/wheel to zoom, click-drag to pan (X axis only).</span>
-    <button class="reset-btn" id="train-reset">Reset zoom</button>
-  </div>
-  <div class="chart-wrap"><canvas id="train-canvas"></canvas></div>
-  <div class="legend-note">count = this slot's training counter · cumulative promote/demote per slot · dynamic effective promotion threshold (governor) overlaid on every tab.</div>
-</div>
 
-<div class="half">
-  <h2>Prediction table (8 tracked slots)</h2>
-  <div class="tabs" id="pred-tabs"></div>
-  <div class="chart-toolbar">
-    <span class="zoom-hint">Scroll/wheel to zoom, click-drag to pan (X axis only).</span>
-    <button class="reset-btn" id="pred-reset">Reset zoom</button>
-  </div>
-  <div class="chart-wrap"><canvas id="pred-canvas"></canvas></div>
-  <div class="legend-note">critical bit (0/1, right axis) and hitCount (left axis) for this slot · overall critical/total lookup ratio overlaid on every tab.</div>
-</div>
+def show(dataset):
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import RadioButtons
 
-<script>
-const DATA = __DATA_JSON__;
+    fig = plt.figure(figsize=(13, 9))
+    fig.suptitle("Criticality predictor trace -- X axis: cumulative decoded instructions")
+    fig.subplots_adjust(left=0.14, right=0.88, top=0.93, bottom=0.06, hspace=0.35)
 
-Chart.register(window['chartjs-plugin-zoom'] || window.ChartZoom);
+    ax_train = fig.add_axes([0.14, 0.55, 0.72, 0.38])
+    ax_train_r = ax_train.twinx()
+    ax_pred = fig.add_axes([0.14, 0.07, 0.72, 0.38])
+    ax_pred_r = ax_pred.twinx()
 
-const ZOOM_PAN_OPTIONS = {
-  pan: { enabled: true, mode: 'x' },
-  zoom: {
-    wheel: { enabled: true },
-    pinch: { enabled: true },
-    drag: { enabled: false },
-    mode: 'x',
-  },
-};
+    ax_train_radio = fig.add_axes([0.89, 0.55, 0.1, 0.38], frameon=False)
+    ax_pred_radio = fig.add_axes([0.89, 0.07, 0.1, 0.38], frameon=False)
+    labels = [f"Slot {i}" for i in range(NUM_TRACK_SLOTS)]
+    train_radio = RadioButtons(ax_train_radio, labels)
+    pred_radio = RadioButtons(ax_pred_radio, labels)
 
-function pcMarkerPlugin(pcChanges) {
-  return {
-    id: 'pcMarkers',
-    afterDraw(chart) {
-      const xScale = chart.scales.x;
-      const ctx = chart.ctx;
-      const top = chart.chartArea.top;
-      const bottom = chart.chartArea.bottom;
-      ctx.save();
-      ctx.strokeStyle = '#ffa726';
-      ctx.setLineDash([4, 4]);
-      ctx.lineWidth = 1;
-      pcChanges.forEach(ch => {
-        const xPix = xScale.getPixelForValue(ch.decode);
-        if (xPix < chart.chartArea.left || xPix > chart.chartArea.right) return;
-        ctx.beginPath();
-        ctx.moveTo(xPix, top);
-        ctx.lineTo(xPix, bottom);
-        ctx.stroke();
-      });
-      ctx.restore();
-    }
-  };
-}
+    def draw_pc_markers(ax, pc_changes):
+        for decode, pc in pc_changes:
+            ax.axvline(decode, color="#ffa726", linestyle="--", linewidth=1, alpha=0.5)
 
-function makeTrainChart(canvas, slotIdx) {
-  const sd = DATA.train_slots[slotIdx];
-  return new Chart(canvas, {
-    type: 'line',
-    data: {
-      datasets: [
-        { label: 'count', data: sd.count_series, borderColor: '#4fc3f7',
-          stepped: true, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-        { label: 'cumulative promotes', data: sd.promote_cum, borderColor: '#66bb6a',
-          stepped: true, pointRadius: 0, borderWidth: 2, yAxisID: 'y2' },
-        { label: 'cumulative demotes', data: sd.demote_cum, borderColor: '#ef5350',
-          stepped: true, pointRadius: 0, borderWidth: 2, yAxisID: 'y2' },
-        { label: 'effective promote threshold', data: DATA.effective_series, borderColor: '#bdbdbd',
-          stepped: true, pointRadius: 0, borderWidth: 1, borderDash: [2, 2], yAxisID: 'y' },
-      ]
-    },
-    options: {
-      animation: false,
-      parsing: false,
-      scales: {
-        x: { type: 'linear', title: { display: true, text: 'decoded instructions' },
-             grid: { color: '#2a2e38' } },
-        y: { position: 'left', title: { display: true, text: 'count / threshold' },
-             grid: { color: '#2a2e38' } },
-        y2: { position: 'right', title: { display: true, text: 'cumulative events' },
-              grid: { drawOnChartArea: false } },
-      },
-      plugins: { legend: { labels: { color: '#e6e6e6' } }, zoom: ZOOM_PAN_OPTIONS },
-    },
-    plugins: [pcMarkerPlugin(sd.pc_changes)],
-  });
-}
+    def draw_train(slot_idx):
+        ax_train.clear()
+        ax_train_r.clear()
+        sd = dataset["train_slots"][slot_idx]
 
-function makePredChart(canvas, slotIdx) {
-  const sd = DATA.pred_slots[slotIdx];
-  return new Chart(canvas, {
-    type: 'line',
-    data: {
-      datasets: [
-        { label: 'critical bit', data: sd.critical_series, borderColor: '#4fc3f7',
-          stepped: true, pointRadius: 0, borderWidth: 2, yAxisID: 'ybit' },
-        { label: 'hitCount', data: sd.hitcount_series, borderColor: '#ffb74d',
-          stepped: true, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-        { label: 'overall critical/total ratio', data: DATA.critical_ratio_series, borderColor: '#bdbdbd',
-          pointRadius: 0, borderWidth: 1, borderDash: [2, 2], yAxisID: 'ybit' },
-      ]
-    },
-    options: {
-      animation: false,
-      parsing: false,
-      scales: {
-        x: { type: 'linear', title: { display: true, text: 'decoded instructions' },
-             grid: { color: '#2a2e38' } },
-        y: { position: 'right', title: { display: true, text: 'hitCount' },
-             grid: { drawOnChartArea: false } },
-        ybit: { position: 'left', min: 0, max: 1.05,
-                title: { display: true, text: 'critical bit / ratio' },
-                grid: { color: '#2a2e38' } },
-      },
-      plugins: { legend: { labels: { color: '#e6e6e6' } }, zoom: ZOOM_PAN_OPTIONS },
-    },
-    plugins: [pcMarkerPlugin(sd.pc_changes)],
-  });
-}
+        draw_pc_markers(ax_train, sd.pc_changes)
 
-function setupTabs(tabsDiv, canvas, resetBtn, makeChart) {
-  let chart = null;
-  function render(idx) {
-    [...tabsDiv.children].forEach((btn, i) => btn.classList.toggle('active', i === idx));
-    if (chart) chart.destroy();
-    chart = makeChart(canvas, idx);
-  }
-  for (let i = 0; i < 8; i++) {
-    const btn = document.createElement('button');
-    btn.className = 'tab-btn';
-    btn.textContent = 'Slot ' + i;
-    btn.onclick = () => render(i);
-    tabsDiv.appendChild(btn);
-  }
-  resetBtn.onclick = () => { if (chart) chart.resetZoom(); };
-  render(0);
-}
+        xs, ys = _xy(sd.count_series)
+        ax_train.step(xs, ys, where="post", color="#1f77b4", label="count", linewidth=1.5)
+        xs, ys = _xy(dataset["effective_series"])
+        ax_train.step(xs, ys, where="post", color="#888888", linestyle=":",
+                       label="effective promote threshold", linewidth=1.2)
 
-setupTabs(document.getElementById('train-tabs'), document.getElementById('train-canvas'),
-          document.getElementById('train-reset'), makeTrainChart);
-setupTabs(document.getElementById('pred-tabs'), document.getElementById('pred-canvas'),
-          document.getElementById('pred-reset'), makePredChart);
-</script>
-</body>
-</html>
-"""
+        xs, ys = _xy(sd.promote_cum)
+        ax_train_r.step(xs, ys, where="post", color="#2ca02c", label="cumulative promotes", linewidth=1.5)
+        xs, ys = _xy(sd.demote_cum)
+        ax_train_r.step(xs, ys, where="post", color="#d62728", label="cumulative demotes", linewidth=1.5)
+
+        ax_train.set_title(f"Training table -- Slot {slot_idx}")
+        ax_train.set_xlabel("decoded instructions")
+        ax_train.set_ylabel("count / threshold")
+        ax_train_r.set_ylabel("cumulative events")
+        lines1, labels1 = ax_train.get_legend_handles_labels()
+        lines2, labels2 = ax_train_r.get_legend_handles_labels()
+        ax_train.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+        ax_train.grid(True, alpha=0.2)
+        fig.canvas.draw_idle()
+
+    def draw_pred(slot_idx):
+        ax_pred.clear()
+        ax_pred_r.clear()
+        sd = dataset["pred_slots"][slot_idx]
+
+        draw_pc_markers(ax_pred, sd.pc_changes)
+
+        xs, ys = _xy(sd.critical_series)
+        ax_pred.step(xs, ys, where="post", color="#1f77b4", label="critical bit", linewidth=1.5)
+        xs, ys = _xy(dataset["critical_ratio_series"])
+        ax_pred.plot(xs, ys, color="#888888", linestyle=":",
+                      label="overall critical/total ratio", linewidth=1.2)
+        ax_pred.set_ylim(-0.05, 1.1)
+
+        xs, ys = _xy(sd.hitcount_series)
+        ax_pred_r.step(xs, ys, where="post", color="#ff7f0e", label="hitCount", linewidth=1.5)
+
+        ax_pred.set_title(f"Prediction table -- Slot {slot_idx}")
+        ax_pred.set_xlabel("decoded instructions")
+        ax_pred.set_ylabel("critical bit / ratio")
+        ax_pred_r.set_ylabel("hitCount")
+        lines1, labels1 = ax_pred.get_legend_handles_labels()
+        lines2, labels2 = ax_pred_r.get_legend_handles_labels()
+        ax_pred.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+        ax_pred.grid(True, alpha=0.2)
+        fig.canvas.draw_idle()
+
+    train_radio.on_clicked(lambda label: draw_train(int(label.split()[-1])))
+    pred_radio.on_clicked(lambda label: draw_pred(int(label.split()[-1])))
+
+    draw_train(0)
+    draw_pred(0)
+
+    plt.show()
 
 
 def main():
@@ -356,7 +262,6 @@ def main():
         print(__doc__)
         sys.exit(1)
     log_path = sys.argv[1]
-    out_path = sys.argv[2] if len(sys.argv) > 2 else "trace_viz.html"
 
     events = []
     with open(log_path, "r", errors="replace") as f:
@@ -370,27 +275,9 @@ def main():
               f"was CriticalityConfig::enableTraceLog set?", file=sys.stderr)
         sys.exit(1)
 
+    print(f"Parsed {len(events)} trace lines, opening plot window...")
     dataset = build_dataset(events)
-
-    json_data = {
-        "train_slots": {
-            str(i): dataset["train_slots"][i].__dict__ for i in range(NUM_TRACK_SLOTS)
-        },
-        "pred_slots": {
-            str(i): dataset["pred_slots"][i].__dict__ for i in range(NUM_TRACK_SLOTS)
-        },
-        "effective_series": dataset["effective_series"],
-        "critical_ratio_series": dataset["critical_ratio_series"],
-    }
-    # JS object keys from json.dumps come out as strings ("0","1",...);
-    # index with DATA.train_slots[slotIdx] in JS still works since JS
-    # coerces the numeric index to the same string key.
-
-    page = PAGE_TEMPLATE.replace("__DATA_JSON__", json.dumps(json_data))
-    with open(out_path, "w") as f:
-        f.write(page)
-
-    print(f"Parsed {len(events)} trace lines -> {out_path}")
+    show(dataset)
 
 
 if __name__ == "__main__":
