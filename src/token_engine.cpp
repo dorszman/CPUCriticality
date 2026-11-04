@@ -30,6 +30,29 @@ void IncrementIfSet(StatCounter* counter) {
 // own logging is interleaved on the same stream.
 constexpr const char* kTraceLogPrefix = "@@ISQCRIT@@";
 
+// Shared by TrainOn()/Promote(): logs an Acquire() that didn't hit an
+// existing entry, i.e. a slot allocation -- always reported as
+// event=alloc, whether or not a prior occupant had to be evicted to
+// make room (true in steady state for essentially every allocation
+// past a table's initial fill); old_pc is simply omitted on the rare
+// case where the way was already free, rather than needing a separate
+// event type.
+void TraceLogAcquire(bool enabled, const char* table, std::size_t index, bool wasHit,
+                      bool wasEviction, Addr evictedTag, Addr newPc, std::uint64_t decode) {
+    if (!enabled || wasHit) return;
+    if (wasEviction) {
+        std::printf("%s table=%s slot=%zu event=alloc old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
+                    kTraceLogPrefix, table, index,
+                    static_cast<unsigned long long>(evictedTag),
+                    static_cast<unsigned long long>(newPc),
+                    static_cast<unsigned long long>(decode));
+    } else {
+        std::printf("%s table=%s slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
+                    kTraceLogPrefix, table, index, static_cast<unsigned long long>(newPc),
+                    static_cast<unsigned long long>(decode));
+    }
+}
+
 // A PC-indexed, set-associative table shared by the training and
 // prediction tables. EntryT must have 'bool valid' and 'Addr tag'
 // members (TrainEntry and PredEntry both do); whatever else it carries
@@ -389,19 +412,8 @@ struct TokenEngine::Impl {
     void TrainOn(Addr pc, std::int64_t distance) {
         auto acq = trainTable.Acquire(pc);
         TrainEntry& e = acq.entry;
-        if (cfg.enableTraceLog) {
-            if (acq.wasEviction) {
-                std::printf("%s table=train slot=%zu event=evict old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
-                            kTraceLogPrefix, acq.index,
-                            static_cast<unsigned long long>(acq.evictedTag),
-                            static_cast<unsigned long long>(pc),
-                            static_cast<unsigned long long>(decodeCounter));
-            } else if (!acq.wasHit) {
-                std::printf("%s table=train slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
-                            kTraceLogPrefix, acq.index, static_cast<unsigned long long>(pc),
-                            static_cast<unsigned long long>(decodeCounter));
-            }
-        }
+        TraceLogAcquire(cfg.enableTraceLog, "train", acq.index, acq.wasHit, acq.wasEviction,
+                        acq.evictedTag, pc, decodeCounter);
 
         if (distance <= cfg.criticalDistanceCycles) {
             e.count = ClampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
@@ -431,19 +443,8 @@ struct TokenEngine::Impl {
     void Promote(Addr pc, bool critical) {
         auto acq = predTable.Acquire(pc); // valid/tag already correct either way
         PredEntry& e = acq.entry;
-        if (cfg.enableTraceLog) {
-            if (acq.wasEviction) {
-                std::printf("%s table=pred slot=%zu event=evict old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
-                            kTraceLogPrefix, acq.index,
-                            static_cast<unsigned long long>(acq.evictedTag),
-                            static_cast<unsigned long long>(pc),
-                            static_cast<unsigned long long>(decodeCounter));
-            } else if (!acq.wasHit) {
-                std::printf("%s table=pred slot=%zu event=alloc new_pc=0x%llx decode=%llu\n",
-                            kTraceLogPrefix, acq.index, static_cast<unsigned long long>(pc),
-                            static_cast<unsigned long long>(decodeCounter));
-            }
-        }
+        TraceLogAcquire(cfg.enableTraceLog, "pred", acq.index, acq.wasHit, acq.wasEviction,
+                        acq.evictedTag, pc, decodeCounter);
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
         else IncrementIfSet(statPtrs.nonCriticalPromotions);

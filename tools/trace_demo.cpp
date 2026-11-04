@@ -12,7 +12,8 @@
 // PC is first driven with several critical-distance edges (pushing it
 // toward promotion), then several non-critical-distance edges (pushing
 // it toward demotion) before the next generation evicts it -- so each
-// tracked slot's lifetime shows alloc -> promote -> demote -> evict.
+// tracked slot's lifetime shows alloc -> promote -> demote -> alloc (by
+// the next generation, evicting this one).
 //
 // Build: g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/token.cpp -o trace_demo
 // Run:   ./trace_demo > /tmp/trace.log

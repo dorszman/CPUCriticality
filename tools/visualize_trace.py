@@ -62,7 +62,7 @@ class SlotData:
         self.hitcount_series = []    # prediction table only
         self.promote_cum = []        # cumulative count, step series
         self.demote_cum = []
-        self.pc_changes = []         # [{decode, pc}] for alloc/evict
+        self.pc_changes = []         # [{decode, pc}] for each alloc event
 
 
 def build_dataset(events):
@@ -79,7 +79,7 @@ def build_dataset(events):
     # slot currently holds that PC (promotion is triggered by crossing a
     # training-table threshold). The log doesn't carry the training slot
     # index on those lines, so we track current occupancy of each
-    # training slot ourselves, from that same table's own alloc/evict
+    # training slot ourselves, from that same table's own alloc
     # events, processed in the same chronological order as the log.
     pc_to_train_slot = {}
 
@@ -100,11 +100,12 @@ def build_dataset(events):
             if slot is None or slot < 0 or slot >= NUM_TRACK_SLOTS:
                 continue
             sd = train_slots[slot]
-            if event in ("alloc", "evict"):
+            if event == "alloc":
                 new_pc = ev["new_pc"]
                 sd.pc_changes.append({"decode": decode, "pc": pc_hex(new_pc)})
-                if event == "evict":
-                    pc_to_train_slot.pop(ev["old_pc"], None)
+                old_pc = ev.get("old_pc")  # absent when the way was simply free
+                if old_pc is not None:
+                    pc_to_train_slot.pop(old_pc, None)
                 pc_to_train_slot[new_pc] = slot
             elif event == "update":
                 sd.count_series.append({"x": decode, "y": ev["count"]})
@@ -124,7 +125,7 @@ def build_dataset(events):
                     sd.hitcount_series.append({"x": decode, "y": ev["hitCount"]})
                 continue
 
-            if event in ("alloc", "evict"):
+            if event == "alloc":
                 slot = ev.get("slot")
                 if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                     pred_slots[slot].pc_changes.append(
@@ -189,7 +190,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>Criticality predictor trace</h1>
-<div class="sub">X axis: cumulative decoded instructions. Dashed vertical lines mark a slot's occupant PC changing (alloc/evict).</div>
+<div class="sub">X axis: cumulative decoded instructions. Dashed vertical lines mark a slot's occupant PC changing (allocation, evicting any prior occupant).</div>
 
 <div class="half">
   <h2>Training table (8 tracked slots)</h2>
