@@ -39,7 +39,7 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace cacrit;
+using namespace ISQCrit;
 
 using Ptag = std::uint64_t;
 constexpr Ptag kNoPtag = 0;
