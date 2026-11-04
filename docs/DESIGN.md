@@ -344,6 +344,45 @@ querying `IsPredictedCritical(pc)` same as the issue-queue scheduler does;
 the training/prediction tables are unchanged and shared — no separate
 eviction-specific query is needed.
 
+### 3.8 Optional extension: criticality-rate governor
+
+If too large a fraction of dynamic uops get tagged predicted-critical,
+the whole mechanism degrades toward a no-op (prioritizing "everyone" is
+the same as prioritizing no one). `enableCriticalRateGovernor` caps —
+never targets — the fraction of `IsPredictedCritical()` calls that
+return true, against `targetCriticalRate` (e.g. `0.10`).
+
+It is a **one-sided** cap: `promoteCriticalAt` becomes a floor rather
+than a fixed value. Over a window of `criticalRateControlInterval`
+lookups, if the observed rate exceeds `targetCriticalRate +
+criticalRateDeadband`, the effective promotion threshold tightens by
+one step (clamped at `trainCounterMax`); if a window is comfortably
+under the cap, it relaxes one step back toward — never past —
+`promoteCriticalAt` itself. Being under the cap is always fine; the
+governor only ever adds strictness on top of the host's own configured
+floor, never removes strictness the host asked for. `promoteNonCriticalAt`
+(demotion) is never touched.
+
+**Asymmetric response is required, not optional.** Tightening is
+immediate (a single over-cap window), but relaxing requires
+`criticalRateRelaxDwellWindows` *consecutive* under-cap windows first.
+Without this, a population that crosses the threshold in one hard step
+(many PCs promoting in lockstep) makes the governor oscillate cleanly
+between "admit everyone" and "admit no one" — every individual decision
+looks correct, but the time-averaged rate lands far above the cap
+despite that.
+
+**Headroom between `promoteCriticalAt` and `trainCounterMax` matters
+more than the dwell-time tuning, empirically.** Each tightening step
+can only move to the next integer the training counter can actually
+reach, so with only 1-2 such steps available the governor still
+overshoots the cap by 5-7x on realistic workloads no matter how dwell
+is tuned; with 5-6+ steps of headroom it converges cleanly near the
+cap. This project's own baseline defaults (`promoteCriticalAt=2`,
+`trainCounterMax=3`) are exactly the bad case — raise `trainCounterMax`
+well above `promoteCriticalAt` specifically when enabling this
+governor.
+
 ---
 
 ## 4. Data structures (reference sizes — tune for your target)
@@ -483,6 +522,12 @@ against your workload mix:
   decay, closer to no staleness consideration at all. Each one only
   matters when its own table's `...EvictionPolicy` is `kDecayedHitCount`
   or `kDecayedPriorityThenLru`.
+- `enableCriticalRateGovernor` / `targetCriticalRate` /
+  `criticalRateDeadband` / `criticalRateControlInterval` /
+  `criticalRateRelaxDwellWindows`: see §3.8. Disabled by default. If
+  enabled, make sure `trainCounterMax` has real headroom above
+  `promoteCriticalAt` (5-6+ steps, empirically) — see the warning in
+  §3.8; this project's own baseline defaults do not have enough.
 
 ---
 

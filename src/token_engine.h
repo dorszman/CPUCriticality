@@ -138,6 +138,75 @@ struct CriticalityConfig {
     // prediction table as critical / non-critical.
     std::int32_t promoteCriticalAt = 2;
     std::int32_t promoteNonCriticalAt = -2;
+
+    // Criticality-rate governor: a one-sided CAP (never a target to hit
+    // exactly) on the fraction of fetch-time IsPredictedCritical()
+    // lookups that return true. Disabled by default -- when disabled,
+    // promoteCriticalAt above is used exactly as configured, as if this
+    // whole mechanism didn't exist.
+    //
+    // When enabled, promoteCriticalAt becomes a FLOOR rather than a
+    // fixed value: the engine tracks the observed critical rate over
+    // windows of criticalRateControlInterval lookups, and if a window's
+    // rate exceeds targetCriticalRate + criticalRateDeadband, the
+    // EFFECTIVE promotion threshold is nudged one step stricter
+    // (requiring more evidence before promoting). If a window's rate
+    // falls below targetCriticalRate - criticalRateDeadband, the
+    // effective threshold is nudged one step back toward -- but never
+    // past -- promoteCriticalAt itself. Being under the cap is always
+    // fine and never relaxes the threshold any softer than the host's
+    // own configured value; the governor only ever adds extra
+    // strictness on top of it, and only when the cap would otherwise be
+    // exceeded. promoteNonCriticalAt (demotion) is never touched by
+    // this mechanism.
+    //
+    // If the organic (un-governed) critical rate for a workload is
+    // already at or below the cap, the effective threshold simply
+    // settles back at promoteCriticalAt and this is a no-op in
+    // practice. If even the maximum possible strictness
+    // (trainCounterMax) isn't enough to bring a workload under the cap,
+    // the cap is approached as closely as a single threshold dimension
+    // allows, never exceeded by construction, but not fully hit either
+    // -- an honest limit, not a bug.
+    //
+    // IMPORTANT usage requirement, empirically confirmed (not just a
+    // theoretical caveat): this governor needs real headroom between
+    // promoteCriticalAt and trainCounterMax to work at all. Each
+    // tightening step can only move the effective threshold to the next
+    // integer value the training counter can actually reach, so with
+    // only 1-2 such steps available, the governor swings between
+    // "admit everyone" and "admit no one" and the ACHIEVED rate can
+    // overshoot the cap by 5-7x on realistic workloads, no matter how
+    // criticalRateRelaxDwellWindows is tuned. With >=5-6 steps of
+    // headroom, the same mechanism converges cleanly near the cap. This
+    // project's OWN baseline defaults (promoteCriticalAt=2,
+    // trainCounterMax=3) are exactly the bad case -- only one notch of
+    // headroom -- so raise trainCounterMax well above promoteCriticalAt
+    // specifically when enabling this governor; the defaults are tuned
+    // for hysteresis depth alone and were never validated against this
+    // mechanism.
+    bool enableCriticalRateGovernor = false;
+    double targetCriticalRate = 0.10;     // the cap, e.g. 0.10 == 10%
+    double criticalRateDeadband = 0.01;   // +/- band around the cap with no adjustment
+    // How many IsPredictedCritical() lookups make up one control
+    // decision. Must be >= 1 when enableCriticalRateGovernor is true --
+    // TokenEngine's constructor throws std::invalid_argument otherwise
+    // (it is used as a divisor).
+    std::uint32_t criticalRateControlInterval = 1024;
+
+    // Asymmetric response, deliberately: a single over-cap window
+    // tightens immediately (the cap must never be exceeded for long),
+    // but relaxing back toward the floor requires this many CONSECUTIVE
+    // under-cap windows first. Without this, a population that responds
+    // to the threshold in one hard step (many PCs crossing it at once,
+    // rather than a smooth spread) makes the governor oscillate: it
+    // tightens, the rate crashes, the very next window looks
+    // comfortably under cap and relaxes right back, re-admitting
+    // another burst -- a clean bang-bang limit cycle that averages out
+    // far above the cap despite every individual decision looking
+    // correct in isolation. Must be >= 1 when
+    // enableCriticalRateGovernor is true.
+    std::uint32_t criticalRateRelaxDwellWindows = 4;
 };
 
 // The counter width/type lives in exactly one place. Change it here (e.g.

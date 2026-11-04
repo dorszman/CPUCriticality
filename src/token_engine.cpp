@@ -211,6 +211,16 @@ struct TokenEngine::Impl {
         if (cfg.predictionTableDecayIdleUnit == 0) {
             throw std::invalid_argument("CriticalityConfig::predictionTableDecayIdleUnit must be >= 1");
         }
+        if (cfg.enableCriticalRateGovernor && cfg.criticalRateControlInterval == 0) {
+            throw std::invalid_argument(
+                "CriticalityConfig::criticalRateControlInterval must be >= 1 when "
+                "enableCriticalRateGovernor is true");
+        }
+        if (cfg.enableCriticalRateGovernor && cfg.criticalRateRelaxDwellWindows == 0) {
+            throw std::invalid_argument(
+                "CriticalityConfig::criticalRateRelaxDwellWindows must be >= 1 when "
+                "enableCriticalRateGovernor is true");
+        }
 
         tokenPool.resize(cfg.tokenPoolSize);
         freeList.reserve(cfg.tokenPoolSize);
@@ -224,6 +234,12 @@ struct TokenEngine::Impl {
                               cfg.trainingTableEvictionPolicy, cfg.trainingTableDecayIdleUnit);
         predTable.Configure(cfg.predictionTableEntriesLog2, cfg.predictionTableWays,
                              cfg.predictionTableEvictionPolicy, cfg.predictionTableDecayIdleUnit);
+
+        // Floor == the host's own configured value; see
+        // CriticalityConfig::enableCriticalRateGovernor. Equal to
+        // cfg.promoteCriticalAt and never updated when the governor is
+        // disabled, so TrainOn() below can use this field unconditionally.
+        promoteCriticalAtEffective = cfg.promoteCriticalAt;
     }
 
     // --- Token pool ------------------------------------------------------
@@ -290,6 +306,19 @@ struct TokenEngine::Impl {
     std::uint64_t decodeCounter = 0;
     Cycle currentCycle = 0;
 
+    // --- Criticality-rate governor ---------------------------------------
+    // See CriticalityConfig::enableCriticalRateGovernor. Set to
+    // cfg.promoteCriticalAt in the constructor and never touched again
+    // when the governor is disabled, so TrainOn() can read this
+    // unconditionally either way. mutable: updated from inside
+    // LookupPrediction(), which is logically read-only to its caller --
+    // same justification as SetAssociativeTable's own recency/decay
+    // bookkeeping.
+    mutable std::int32_t promoteCriticalAtEffective = 0;
+    mutable std::uint32_t rateWindowHits = 0;
+    mutable std::uint32_t rateWindowTotal = 0;
+    mutable std::uint32_t rateGoodWindowStreak = 0; // see criticalRateRelaxDwellWindows
+
     // Called once per decoded uop, unconditionally. Always advances the
     // sampling counter first (so it tracks decoded uops, not granted
     // tokens), then decides in the SAME call whether this decode earns a
@@ -335,7 +364,11 @@ struct TokenEngine::Impl {
         }
         IncrementIfSet(statPtrs.trainingEvents);
 
-        if (e.count >= cfg.promoteCriticalAt) {
+        // promoteCriticalAtEffective == cfg.promoteCriticalAt whenever
+        // the governor is disabled (never updated in that case) or the
+        // observed rate is within its cap -- see
+        // CriticalityConfig::enableCriticalRateGovernor.
+        if (e.count >= promoteCriticalAtEffective) {
             Promote(pc, true);
         } else if (e.count <= cfg.promoteNonCriticalAt) {
             Promote(pc, false);
@@ -351,7 +384,51 @@ struct TokenEngine::Impl {
 
     bool LookupPrediction(Addr pc) const {
         const PredEntry* e = predTable.Find(pc);
-        return e ? e->critical : false; // unknown PC defaults to non-critical (baseline behavior)
+        bool critical = e ? e->critical : false; // unknown PC defaults to non-critical (baseline)
+        if (cfg.enableCriticalRateGovernor) {
+            UpdateRateGovernor(critical);
+        }
+        return critical;
+    }
+
+    // Caps -- never targets -- the fraction of LookupPrediction() calls
+    // that return true, by making promoteCriticalAtEffective
+    // progressively stricter than its floor (cfg.promoteCriticalAt)
+    // when over the cap, and relaxing it back toward -- never past --
+    // that floor when comfortably under. This is a one-sided cap, not a
+    // setpoint to converge on exactly: once at the floor, being under
+    // cap is simply left alone.
+    //
+    // Asymmetric response: tightening is immediate (any single over-cap
+    // window), but relaxing requires criticalRateRelaxDwellWindows
+    // CONSECUTIVE under-cap windows first (see its comment in
+    // token_engine.h) -- without this, a sharp tighten-then-crash
+    // produces a clean bang-bang limit cycle that averages out far
+    // above the cap despite every individual decision looking correct
+    // in isolation.
+    void UpdateRateGovernor(bool critical) const {
+        ++rateWindowTotal;
+        if (critical) ++rateWindowHits;
+        if (rateWindowTotal < cfg.criticalRateControlInterval) return;
+
+        double rate = static_cast<double>(rateWindowHits) / rateWindowTotal;
+        if (rate > cfg.targetCriticalRate + cfg.criticalRateDeadband) {
+            promoteCriticalAtEffective =
+                std::min(promoteCriticalAtEffective + 1, cfg.trainCounterMax);
+            rateGoodWindowStreak = 0;
+        } else if (rate < cfg.targetCriticalRate - cfg.criticalRateDeadband &&
+                   promoteCriticalAtEffective > cfg.promoteCriticalAt) {
+            ++rateGoodWindowStreak;
+            if (rateGoodWindowStreak >= cfg.criticalRateRelaxDwellWindows) {
+                promoteCriticalAtEffective =
+                    std::max(promoteCriticalAtEffective - 1, cfg.promoteCriticalAt);
+                rateGoodWindowStreak = 0;
+            }
+        } else {
+            rateGoodWindowStreak = 0; // in the deadband: neutral, not "good"
+        }
+        rateWindowHits = 0;
+        rateWindowTotal = 0;
     }
 
     // Returns a slot to the pool and bumps its epoch, regardless of WHY
