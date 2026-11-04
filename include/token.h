@@ -40,7 +40,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 
 namespace cacrit {
 
@@ -70,29 +69,33 @@ private:
     // current cycle is tracked by the owning engine (see
     // TokenEngine::Tick), not threaded through every call.
     //
-    // Returns true if this was the token's first execute (its producer's
-    // execute cycle was just recorded; nothing trained yet) -- the host
-    // should then consult its own issue-queue wakeup logic: hand this
-    // token's TokenRef to every consumer the broadcast woke (a copy each,
-    // if more than one), or drop it if it woke nobody.
+    // Returns true if this call found the token in PendingProducerExe
+    // (the producer's write-back cycle was just recorded into
+    // producerWbTime_, and the state advances to PendingConsumerExe;
+    // nothing trained yet) -- the host should then consult its own
+    // issue-queue wakeup logic: hand this token's TokenRef to every
+    // consumer the broadcast woke (a copy each, if more than one), or
+    // drop it if it woke nobody.
     //
-    // Returns false once the measurement closes (trains the original PC
-    // against the distance to this execute) -- at which point the slot is
-    // immediately recycled (epoch bumped) regardless of any other
-    // TokenRef copies still outstanding. The host should simply drop the
-    // token either way; it is never told which outcome happened, because
-    // it never needs to know.
+    // Returns false once called while PendingConsumerExe (this closes the
+    // measurement: trains the original PC against the distance to this
+    // execute) -- at which point the slot is immediately recycled (epoch
+    // bumped) regardless of any other TokenRef copies still outstanding.
+    // The host should simply drop the token either way; it is never told
+    // which outcome happened, because it never needs to know.
     bool DoNotifyExecuted();
+
+    // Invalid: the slot is free, sitting in the pool, waiting for the
+    // next DecodeGetToken assignment -- nobody holds a live TokenRef to
+    // it. PendingProducerExe / PendingConsumerExe: as before (§ above).
+    enum class State : std::uint8_t { Invalid, PendingProducerExe, PendingConsumerExe };
 
     TokenEngine* engine_ = nullptr;
     unsigned refcount_ = 0;
-    bool valid_ = false;
     Epoch epoch_ = 0; // bumped every time this slot returns to the pool
     Addr pc_ = 0; // fixed at creation; trained when the measurement closes
-    // Cycle the producer (pc_) executed, i.e. its "production time" --
-    // empty until the first successful call records it. Present once set
-    // means a subsequent call is an attempt to close the measurement.
-    std::optional<Cycle> rootExecCycle_;
+    State state_ = State::Invalid;
+    Cycle producerWbTime_ = 0; // valid once state_ == PendingConsumerExe
     std::size_t poolIndex_ = 0;
 };
 

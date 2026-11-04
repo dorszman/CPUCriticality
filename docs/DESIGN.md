@@ -153,13 +153,13 @@ extension, not something the original mechanism does.)
 
 `NotifyExecuted()` returns a `bool`:
 
-- **`true`** — this was the token's *first* execute. Its production cycle
-  was just recorded (internally, via an `std::optional<Cycle>` that goes
-  from empty to set — there is no separate boolean "state" field; presence
-  of a value *is* the signal). Nothing is trained yet. The host should
-  consult its own wakeup result from this broadcast (§3.2): hand a copy of
-  the token to every consumer that got woken (one copy if one woken, none
-  if none), or drop it if nobody did.
+- **`true`** — this call found the token in its `PendingProducerExe`
+  state: the producer's write-back cycle was just recorded into
+  `producerWbTime_`, and the token advances to `PendingConsumerExe`.
+  Nothing is trained yet. The host should consult its own wakeup result
+  from this broadcast (§3.2): hand a copy of the token to every consumer
+  that got woken (one copy if one woken, none if none), or drop it if
+  nobody did.
 - **`false`** — either this call closed the measurement, or it was a stale
   no-op (see below); the host cannot tell which, and does not need to. The
   host should simply **drop** the token now (`Reset()` its `TokenRef`)
@@ -288,7 +288,7 @@ training/prediction tables are unchanged and shared.
 
 | Structure | Fields | Default size |
 |---|---|---|
-| `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `valid_`, `epoch_` (bumped every time the slot returns to the pool, for any reason), `pc_` (fixed at creation), `rootExecCycle_` (`std::optional<Cycle>` — empty until the first execute; its presence alone distinguishes "first execute" from "closing execute", no separate state field), `poolIndex_` | 8 entries (3-bit token id) |
+| `Token` (pool entry) | `engine_` (owning engine pointer), `refcount_`, `epoch_` (bumped every time the slot returns to the pool, for any reason), `pc_` (fixed at creation), `state_` (`Invalid` / `PendingProducerExe` / `PendingConsumerExe`), `producerWbTime_` (valid once `state_ == PendingConsumerExe`), `poolIndex_` | 8 entries (3-bit token id) |
 | `TokenRef` | a single `Token*`; held as a plain member of the host's uop class — never tracked by the engine itself | one per uop, usually null |
 | Training table entry | `valid`, `tag (PC)`, `count` (signed, saturating) | 1024 entries, direct-mapped |
 | Prediction table entry | `valid`, `tag (PC)`, `critical` (1 bit) | 1024 entries, direct-mapped |

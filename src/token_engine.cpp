@@ -90,9 +90,9 @@ struct TokenEngine::Impl {
         freeList.pop_back();
 
         Token& t = tokenPool[idx];
-        t.valid_ = true;
         t.pc_ = pc;
-        t.rootExecCycle_.reset();
+        t.state_ = Token::State::PendingProducerExe; // Invalid -> PendingProducerExe
+        t.producerWbTime_ = 0;
         t.refcount_ = 0; // TokenRef ctor below brings this to 1
         // t.epoch_ is deliberately left untouched here: whichever path
         // most recently returned this slot to the pool (RecycleSlot, via
@@ -152,8 +152,8 @@ struct TokenEngine::Impl {
     // (e.g. a slower fan-out sibling that hasn't executed yet) correctly
     // treat itself as stale from this point on -- see token.h.
     void RecycleSlot(Token* token) {
-        token->valid_ = false;
-        token->rootExecCycle_.reset();
+        token->state_ = Token::State::Invalid;
+        token->producerWbTime_ = 0;
         ++token->epoch_;
         freeList.push_back(token->poolIndex_);
         ++stats.tokensExpired;
@@ -177,12 +177,13 @@ struct TokenEngine::Impl {
     // any slower sibling's later call will, by then, fail the epoch check
     // in TokenRef::NotifyExecuted() before it ever reaches here.
     bool UpdateCriticality(Token* token) {
-        if (!token->rootExecCycle_.has_value()) {
-            token->rootExecCycle_ = currentCycle;
+        if (token->state_ == Token::State::PendingProducerExe) {
+            token->producerWbTime_ = currentCycle;
+            token->state_ = Token::State::PendingConsumerExe;
             return true;
         }
         std::int64_t distance =
-            static_cast<std::int64_t>(currentCycle) - static_cast<std::int64_t>(*token->rootExecCycle_);
+            static_cast<std::int64_t>(currentCycle) - static_cast<std::int64_t>(token->producerWbTime_);
         TrainOn(token->pc_, distance);
         RecycleSlot(token); // immediate reuse; do not wait for refcount to reach zero
         return false;
