@@ -163,6 +163,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Criticality predictor trace</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>
 <style>
   :root { --bg: #0f1115; --panel: #1a1d24; --text: #e6e6e6; --accent: #4fc3f7;
           --grid: #2a2e38; --promote: #66bb6a; --demote: #ef5350; --marker: #ffa726; }
@@ -178,6 +180,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .tab-btn.active { background: var(--accent); color: #06232b; font-weight: 600; }
   .chart-wrap { position: relative; height: 320px; }
   .legend-note { color: #9aa0ac; font-size: 11px; margin-top: 6px; }
+  .zoom-hint { color: #9aa0ac; font-size: 11px; }
+  .reset-btn { background: #262b35; color: var(--text); border: 1px solid var(--grid);
+               border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+               margin-left: 10px; }
+  .chart-toolbar { display: flex; align-items: center; margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -187,6 +194,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="half">
   <h2>Training table (8 tracked slots)</h2>
   <div class="tabs" id="train-tabs"></div>
+  <div class="chart-toolbar">
+    <span class="zoom-hint">Scroll/wheel to zoom, click-drag to pan (X axis only).</span>
+    <button class="reset-btn" id="train-reset">Reset zoom</button>
+  </div>
   <div class="chart-wrap"><canvas id="train-canvas"></canvas></div>
   <div class="legend-note">count = this slot's training counter · cumulative promote/demote per slot · dynamic effective promotion threshold (governor) overlaid on every tab.</div>
 </div>
@@ -194,12 +205,28 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="half">
   <h2>Prediction table (8 tracked slots)</h2>
   <div class="tabs" id="pred-tabs"></div>
+  <div class="chart-toolbar">
+    <span class="zoom-hint">Scroll/wheel to zoom, click-drag to pan (X axis only).</span>
+    <button class="reset-btn" id="pred-reset">Reset zoom</button>
+  </div>
   <div class="chart-wrap"><canvas id="pred-canvas"></canvas></div>
   <div class="legend-note">critical bit (0/1, right axis) and hitCount (left axis) for this slot · overall critical/total lookup ratio overlaid on every tab.</div>
 </div>
 
 <script>
 const DATA = __DATA_JSON__;
+
+Chart.register(window['chartjs-plugin-zoom'] || window.ChartZoom);
+
+const ZOOM_PAN_OPTIONS = {
+  pan: { enabled: true, mode: 'x' },
+  zoom: {
+    wheel: { enabled: true },
+    pinch: { enabled: true },
+    drag: { enabled: false },
+    mode: 'x',
+  },
+};
 
 function pcMarkerPlugin(pcChanges) {
   return {
@@ -253,7 +280,7 @@ function makeTrainChart(canvas, slotIdx) {
         y2: { position: 'right', title: { display: true, text: 'cumulative events' },
               grid: { drawOnChartArea: false } },
       },
-      plugins: { legend: { labels: { color: '#e6e6e6' } } },
+      plugins: { legend: { labels: { color: '#e6e6e6' } }, zoom: ZOOM_PAN_OPTIONS },
     },
     plugins: [pcMarkerPlugin(sd.pc_changes)],
   });
@@ -285,17 +312,15 @@ function makePredChart(canvas, slotIdx) {
                 title: { display: true, text: 'critical bit / ratio' },
                 grid: { color: '#2a2e38' } },
       },
-      plugins: { legend: { labels: { color: '#e6e6e6' } } },
+      plugins: { legend: { labels: { color: '#e6e6e6' } }, zoom: ZOOM_PAN_OPTIONS },
     },
     plugins: [pcMarkerPlugin(sd.pc_changes)],
   });
 }
 
-function setupTabs(prefix, tabsDiv, canvas, makeChart) {
+function setupTabs(tabsDiv, canvas, resetBtn, makeChart) {
   let chart = null;
-  let activeIdx = 0;
   function render(idx) {
-    activeIdx = idx;
     [...tabsDiv.children].forEach((btn, i) => btn.classList.toggle('active', i === idx));
     if (chart) chart.destroy();
     chart = makeChart(canvas, idx);
@@ -307,11 +332,14 @@ function setupTabs(prefix, tabsDiv, canvas, makeChart) {
     btn.onclick = () => render(i);
     tabsDiv.appendChild(btn);
   }
+  resetBtn.onclick = () => { if (chart) chart.resetZoom(); };
   render(0);
 }
 
-setupTabs('train', document.getElementById('train-tabs'), document.getElementById('train-canvas'), makeTrainChart);
-setupTabs('pred', document.getElementById('pred-tabs'), document.getElementById('pred-canvas'), makePredChart);
+setupTabs(document.getElementById('train-tabs'), document.getElementById('train-canvas'),
+          document.getElementById('train-reset'), makeTrainChart);
+setupTabs(document.getElementById('pred-tabs'), document.getElementById('pred-canvas'),
+          document.getElementById('pred-reset'), makePredChart);
 </script>
 </body>
 </html>
