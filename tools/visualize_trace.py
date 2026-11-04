@@ -174,7 +174,7 @@ def show(dataset):
     import matplotlib.pyplot as plt
     from matplotlib.widgets import RadioButtons
 
-    fig = plt.figure(figsize=(13, 9))
+    fig = plt.figure(figsize=(10.5, 7))
     fig.suptitle("Criticality predictor trace -- X axis: cumulative decoded instructions")
     fig.subplots_adjust(left=0.14, right=0.88, top=0.93, bottom=0.06, hspace=0.35)
 

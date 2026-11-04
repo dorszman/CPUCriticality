@@ -59,11 +59,15 @@ int main() {
 
     // Real headroom above the floor -- see DESIGN.md Sec 3.8: 1-2 steps
     // of headroom makes the governor overshoot badly regardless of
-    // dwell tuning; this gives it 8.
+    // dwell tuning. repsDist below goes up to 30, so a PC's critical
+    // phase (half its reps) can be up to 15 reps long -- trainCounterMax
+    // needs to clear THAT, not just be "a few steps above the floor",
+    // or the effective threshold hits its own ceiling before it's
+    // actually strict enough to filter most PCs out.
     cfg.promoteCriticalAt = 2;
     cfg.promoteNonCriticalAt = -2;
-    cfg.trainCounterMin = -10;
-    cfg.trainCounterMax = 10;
+    cfg.trainCounterMin = -40;
+    cfg.trainCounterMax = 40;
 
     cfg.enableCriticalRateGovernor = true;
     cfg.targetCriticalRate = 0.10;
