@@ -157,7 +157,12 @@ public:
         return token_->DoNotifyExecuted();
     }
 
-    bool Valid() const { return token_ != nullptr; }
+    // True only if this reference is both non-null AND current (its
+    // captured epoch matches the token's present one). A stale reference
+    // (e.g. a slower fan-out sibling after a faster one already won and
+    // recycled the slot) reports false here, not true -- Valid() means
+    // "safe to act on," not just "was something ever assigned."
+    bool Valid() const { return IsCurrent(); }
     Token* Get() const { return token_; }
 
 private:

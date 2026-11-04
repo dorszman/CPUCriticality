@@ -26,8 +26,8 @@ g++ -std=c++17 -Isrc examples/example_usage.cpp src/token_engine.cpp src/token.c
 The module is simulator-agnostic (C++17, standard library only). A host
 model embeds a `cacrit::TokenRef` as a plain member of its own uop/
 micro-op class, calls `TokenEngine::Tick` once per cycle, and wires in
-`TokenEngine::TokenAvailable` / `DecodeGetToken` at decode and
-`TokenRef::NotifyExecuted` at execute. There is no execute/rename/flush
+`TokenEngine::DecodeGetToken` (called unconditionally, once per decoded
+uop) and `TokenRef::NotifyExecuted` at execute. There is no execute/rename/flush
 hook on the engine at all: hand-off rides directly on the host's own
 issue-queue wakeup logic (a producer whose broadcast wakes one consumer
 hands its token straight to it; wakes several and they each get their own

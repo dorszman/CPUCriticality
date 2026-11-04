@@ -68,18 +68,23 @@ online, consumed at fetch).
 - Maintain a small fixed pool of tokens (reference default: 8 tokens, i.e.
   a 3-bit token ID — deliberately small to bound area/power).
 - As instructions are decoded, assign a free token to an instruction only
-  occasionally: call `TokenAvailable()` once per decoded uop — it always
-  advances an internal sampling counter and returns whether a token may be
-  taken right now — then, if true, `DecodeGetToken(pc)` to actually pop a
-  slot and root it at `pc`. By default this fires on average 1 in N
-  decoded uops (`tokenAssignInterval`), undersampling even when the pool
-  has free slots, matching the original mechanism's deliberate sparsity;
-  setting `pureAvailabilityGating` instead gates purely on pool occupancy
-  (every decoded uop is eligible as long as a slot is free, letting
-  scarcity alone throttle sampling — see docs' config comments for the
-  trade-off). **Do not tag every instruction.** Sparse sampling is what
-  keeps this cheap; the predictor is trained from a statistical sample of
-  the dynamic instruction stream, not from exhaustive tracking.
+  occasionally: call `DecodeGetToken(pc)` once per decoded uop,
+  unconditionally — it always advances an internal sampling counter
+  first, then either pops a free slot and roots it at `pc`, or (most of
+  the time) returns an empty `TokenRef` and touches nothing else. There
+  is no separate availability pre-check to call first; counting and
+  gating happen together in this one call, every time — splitting them
+  across two calls would let the counter stall the moment a decode is
+  gated out, since nothing would be left to advance it. By default a
+  grant fires on average 1 in N decoded uops (`tokenAssignInterval`),
+  undersampling even when the pool has free slots, matching the original
+  mechanism's deliberate sparsity; setting `pureAvailabilityGating`
+  instead gates purely on pool occupancy (every decoded uop is eligible
+  as long as a slot is free, letting scarcity alone throttle sampling —
+  see the config comments for the trade-off). **Do not tag every
+  instruction.** Sparse sampling is what keeps this cheap; the predictor
+  is trained from a statistical sample of the dynamic instruction stream,
+  not from exhaustive tracking.
 - A freshly tagged instruction's PC is **fixed for the token's entire
   lifetime** — it is never reassigned. This single instruction's PC is
   the only thing ever trained by this token (see §3.3): there is no
@@ -323,7 +328,7 @@ pipeline events essentially every OoO performance model already has:
 | Pipeline event (host side) | Call into the engine |
 |---|---|
 | Once per cycle, before any decode/execute hooks that cycle | `engine.Tick(now);` — the engine tracks the current cycle internally so it is never threaded through other calls |
-| Instruction decoded | `if (engine.TokenAvailable()) uop.token = engine.DecodeGetToken(pc);` and, separately, `bool crit = engine.IsPredictedCritical(pc);` to tag the instruction for scheduling use |
+| Instruction decoded | `uop.token = engine.DecodeGetToken(pc);` (unconditional — usually returns empty), and, separately, `bool crit = engine.IsPredictedCritical(pc);` to tag the instruction for scheduling use |
 | Instruction executes / broadcasts result | see the sequence below — exactly once per instruction, alongside whatever the host's own wakeup/match logic already does on this broadcast |
 | Instruction squashed (branch mispredict, exception, etc.) | **no engine call at all** — just let the uop's `TokenRef` member be destroyed/reset as part of normal teardown; that alone releases any token it held (§8) |
 | Issue-queue select logic | `engine.IsPredictedCritical(pc)` (or the tag captured at fetch); combine with `TokenEngine::PriorityBoost(...)` per §3.6 |
@@ -355,6 +360,18 @@ No other coupling is required. The engine never needs to know about
 physical register files, ROB indices, issue-queue internals, or the
 host's own instruction representation beyond opaque `Addr`/`Cycle`
 integers and the `TokenRef` member on the host's own uop type.
+
+**Stats integration.** The engine owns no counter storage of its own —
+counters live wherever the host already keeps them (a field in its own
+stats struct, an element of a counter array, whatever every other
+component's counters already go through). Call `engine.SetupStats(...)`
+once, typically right after construction, with a `CriticalityStatPointers`
+pointing each field at the host's own storage; the engine writes straight
+through those pointers from then on, so the host reads updated values
+directly, on its own schedule, with no call back into the engine ever
+needed. Any field left null is simply never incremented — set up only the
+counters you care about. Never calling `SetupStats()` at all is safe too;
+every counter is then a no-op write-sink.
 
 ---
 
@@ -484,7 +501,7 @@ implementation above.
       class) declarations.
 - [x] `src/token.cpp` — `Token::Release()` / `Token::DoNotifyExecuted()`.
 - [x] `src/token_engine.h` — public API, `CriticalityConfig`,
-      `TokenEngine` class declaration, `CriticalityStats`.
+      `TokenEngine` class declaration, `CriticalityStatPointers`.
 - [x] `src/token_engine.cpp` — implementation of §3.1–§3.5 exactly
       as described above.
 - [x] `examples/example_usage.cpp` — minimal synthetic harness (with a

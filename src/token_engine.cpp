@@ -1,7 +1,7 @@
 #include "token_engine.h"
 
 #include <algorithm>
-#include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace cacrit {
@@ -16,13 +16,23 @@ constexpr std::int32_t ClampAdd(std::int32_t value, std::int32_t delta,
     return result;
 }
 
+// Counter storage lives in the host, not here -- a counter the host
+// never wired up via SetupStats() is simply never incremented.
+void IncrementIfSet(StatCounter* counter) {
+    if (counter) ++(*counter);
+}
+
 } // namespace
 
 struct TokenEngine::Impl {
     Impl(const CriticalityConfig& c, TokenEngine* self_)
         : cfg(c), self(self_) {
-        if (cfg.tokenPoolSize == 0) cfg.tokenPoolSize = 1;
-        if (cfg.tokenAssignInterval == 0) cfg.tokenAssignInterval = 1;
+        if (cfg.tokenPoolSize == 0) {
+            throw std::invalid_argument("CriticalityConfig::tokenPoolSize must be >= 1");
+        }
+        if (cfg.tokenAssignInterval == 0) {
+            throw std::invalid_argument("CriticalityConfig::tokenAssignInterval must be >= 1");
+        }
 
         tokenPool.resize(cfg.tokenPoolSize);
         freeList.reserve(cfg.tokenPoolSize);
@@ -56,33 +66,33 @@ struct TokenEngine::Impl {
 
     CriticalityConfig cfg;
     TokenEngine* self;
-    CriticalityStats stats;
+    CriticalityStatPointers statPtrs; // all null until SetupStats() is called
     std::uint64_t decodeCounter = 0;
     Cycle currentCycle = 0;
 
+    // Assumes 4-byte-aligned (fixed-width RISC-style) instruction
+    // encoding; a real design should size/hash this to its own
+    // fetch-group granularity instead of this fixed default.
+    static constexpr unsigned kPcAlignmentShiftBits = 2;
+
     std::size_t IndexFor(Addr pc, unsigned log2Entries) const {
-        return static_cast<std::size_t>((pc >> 2) & ((std::uint64_t{1} << log2Entries) - 1));
+        return static_cast<std::size_t>((pc >> kPcAlignmentShiftBits) &
+                                         ((std::uint64_t{1} << log2Entries) - 1));
     }
 
-    // Called once per decoded uop. Always advances the sampling counter
-    // (it tracks decoded uops, not granted tokens) regardless of outcome.
-    bool TokenAvailable() {
+    // Called once per decoded uop, unconditionally. Always advances the
+    // sampling counter first (so it tracks decoded uops, not granted
+    // tokens), then decides in the SAME call whether this decode earns a
+    // token -- counting and gating are not split across two calls, so
+    // there is no way for the counter to advance only on grants (which
+    // would stall it the moment the gate ever says no).
+    TokenRef DecodeGetToken(Addr pc) {
         ++decodeCounter;
         if (freeList.empty()) {
-            return false;
+            return TokenRef{};
         }
         if (!cfg.pureAvailabilityGating &&
             (decodeCounter % cfg.tokenAssignInterval) != 0) {
-            return false;
-        }
-        return true;
-    }
-
-    TokenRef DecodeGetToken(Addr pc) {
-        // Defensive fallback: a caller that skips the TokenAvailable()
-        // check, or calls again without rechecking, gets an empty handle
-        // instead of undefined behavior if the pool is actually empty.
-        if (freeList.empty()) {
             return TokenRef{};
         }
 
@@ -100,7 +110,7 @@ struct TokenEngine::Impl {
         // bumped it, and the TokenRef constructed below captures that
         // current value as this new assignment's epoch.
 
-        ++stats.tokensAssigned;
+        IncrementIfSet(statPtrs.tokensAssigned);
         return TokenRef(&t);
     }
 
@@ -119,7 +129,7 @@ struct TokenEngine::Impl {
         } else {
             return; // ambiguous zone: no update, no promotion check
         }
-        ++stats.trainingEvents;
+        IncrementIfSet(statPtrs.trainingEvents);
 
         if (e.count >= cfg.promoteCriticalAt) {
             Promote(pc, true);
@@ -134,8 +144,8 @@ struct TokenEngine::Impl {
         e.valid = true;
         e.tag = pc;
         e.critical = critical;
-        if (critical) ++stats.criticalPromotions;
-        else ++stats.nonCriticalPromotions;
+        if (critical) IncrementIfSet(statPtrs.criticalPromotions);
+        else IncrementIfSet(statPtrs.nonCriticalPromotions);
     }
 
     bool LookupPrediction(Addr pc) const {
@@ -156,7 +166,7 @@ struct TokenEngine::Impl {
         token->producerWbTime_ = 0;
         ++token->epoch_;
         freeList.push_back(token->poolIndex_);
-        ++stats.tokensExpired;
+        IncrementIfSet(statPtrs.tokensExpired);
     }
 
     // --- Token callbacks (see TokenRef::NotifyExecuted / Token::Release) -
@@ -207,10 +217,6 @@ void TokenEngine::Tick(Cycle now) {
     impl_->currentCycle = now;
 }
 
-bool TokenEngine::TokenAvailable() {
-    return impl_->TokenAvailable();
-}
-
 TokenRef TokenEngine::DecodeGetToken(Addr pc) {
     return impl_->DecodeGetToken(pc);
 }
@@ -224,8 +230,8 @@ std::int32_t TokenEngine::PriorityBoost(bool predictedCritical,
     return predictedCritical ? boostMagnitude : 0;
 }
 
-const CriticalityStats& TokenEngine::Stats() const {
-    return impl_->stats;
+void TokenEngine::SetupStats(const CriticalityStatPointers& counters) {
+    impl_->statPtrs = counters;
 }
 
 bool TokenEngine::UpdateCriticality(Token* token) {

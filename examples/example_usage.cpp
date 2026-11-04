@@ -63,6 +63,20 @@ int main() {
 
     TokenEngine engine(cfg);
 
+    // Toy stand-in for the host's OWN stats storage -- a real host already
+    // has somewhere it keeps every component's counters; this engine
+    // never allocates counter storage of its own, so SetupStats() is
+    // given pointers straight into these locals instead.
+    StatCounter tokensAssigned = 0, tokensExpired = 0, trainingEvents = 0,
+                criticalPromotions = 0, nonCriticalPromotions = 0;
+    CriticalityStatPointers hostCounters;
+    hostCounters.tokensAssigned = &tokensAssigned;
+    hostCounters.tokensExpired = &tokensExpired;
+    hostCounters.trainingEvents = &trainingEvents;
+    hostCounters.criticalPromotions = &criticalPromotions;
+    hostCounters.nonCriticalPromotions = &nonCriticalPromotions;
+    engine.SetupStats(hostCounters);
+
     // Toy versions of the host's own structures -- none of this is known
     // to, or owned by, TokenEngine. A real host already has exactly this
     // in its reservation-station wakeup/matching logic; it is reproduced
@@ -80,9 +94,7 @@ int main() {
             waitingOnTag[srcTagIfNotReady].push_back(id);
             pendingOperandCount[id] += 1;
         }
-        if (engine.TokenAvailable()) {
-            u.token = engine.DecodeGetToken(pc); // fresh sample
-        }
+        u.token = engine.DecodeGetToken(pc); // usually empty; occasionally a fresh sample
         rob[id] = std::move(u);
     };
 
@@ -167,7 +179,7 @@ int main() {
     // whole edge, not two.
     const Addr pcF = 0x1010, pcG = 0x1014, pcH = 0x1018;
     const Ptag tF = 201;
-    const std::uint64_t trainingEventsBeforeFanout = engine.Stats().trainingEvents;
+    const StatCounter trainingEventsBeforeFanout = trainingEvents;
 
     decodeAndRename(50, pcG, kNoPtag, /*srcTagIfNotReady=*/tF);
     decodeAndRename(51, pcH, kNoPtag, /*srcTagIfNotReady=*/tF);
@@ -179,7 +191,7 @@ int main() {
     std::printf("pcF predicted-critical (should be 1 -- trained by faster sibling G): %d\n",
                  engine.IsPredictedCritical(pcF));
     std::printf("fan-out race produced %llu training event(s) (should be 1, not 2)\n",
-                 static_cast<unsigned long long>(engine.Stats().trainingEvents - trainingEventsBeforeFanout));
+                 static_cast<unsigned long long>(trainingEvents - trainingEventsBeforeFanout));
 
     std::printf("pcA predicted-critical: %d\n", engine.IsPredictedCritical(pcA));
     std::printf("pcB predicted-critical: %d\n", engine.IsPredictedCritical(pcB));
@@ -194,14 +206,15 @@ int main() {
     decodeAndRename(40, 0x101C, kNoPtag, kNoPtag);
     rob.erase(40);
 
-    const CriticalityStats& s = engine.Stats();
+    // Read straight off the host's own counters -- no call into the
+    // engine needed, they've been live and up to date the whole time.
     std::printf("tokensAssigned=%llu tokensExpired=%llu trainingEvents=%llu "
                 "criticalPromotions=%llu nonCriticalPromotions=%llu\n",
-                static_cast<unsigned long long>(s.tokensAssigned),
-                static_cast<unsigned long long>(s.tokensExpired),
-                static_cast<unsigned long long>(s.trainingEvents),
-                static_cast<unsigned long long>(s.criticalPromotions),
-                static_cast<unsigned long long>(s.nonCriticalPromotions));
+                static_cast<unsigned long long>(tokensAssigned),
+                static_cast<unsigned long long>(tokensExpired),
+                static_cast<unsigned long long>(trainingEvents),
+                static_cast<unsigned long long>(criticalPromotions),
+                static_cast<unsigned long long>(nonCriticalPromotions));
 
     return 0;
 }
