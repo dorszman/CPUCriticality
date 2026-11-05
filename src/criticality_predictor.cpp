@@ -414,6 +414,11 @@ struct CriticalityPredictor::Impl {
     bool LookupPrediction(Addr pc) const {
         ++lookupCounter;
         auto found = predTable.Find(pc);
+        // The REAL, unmasked verdict -- the governor calibrates and the
+        // trace log reports against this, not the masked return value,
+        // so disabling output (enablePrediction=false) never perturbs
+        // the governor's learned threshold or hides what the predictor
+        // is actually deciding from someone inspecting the trace log.
         bool critical = found.entry ? found.entry->critical : false; // unknown PC -> non-critical
         if (cfg.enableCriticalRateGovernor) {
             UpdateRateGovernor(critical);
@@ -426,7 +431,9 @@ struct CriticalityPredictor::Impl {
                         found.entry ? found.entry->hitCount : 0u,
                         static_cast<unsigned long long>(lookupCounter));
         }
-        return critical;
+        // Only the RETURNED value is masked -- see
+        // PredictorConfig::enablePrediction.
+        return cfg.enablePrediction && critical;
     }
 
     // Caps -- never targets -- the fraction of LookupPrediction() calls
@@ -487,11 +494,6 @@ void CriticalityPredictor::UpdateIssueqReadyWaitingTime(Addr producerPc, std::in
 
 bool CriticalityPredictor::IsPredictedCritical(Addr pc) const {
     return impl_->LookupPrediction(pc);
-}
-
-std::int32_t CriticalityPredictor::PriorityBoost(bool predictedCritical,
-                                                  std::int32_t boostMagnitude) {
-    return predictedCritical ? boostMagnitude : 0;
 }
 
 void CriticalityPredictor::SetupStats(const PredictorStatPointers& counters) {

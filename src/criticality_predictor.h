@@ -49,6 +49,18 @@ enum class EvictionPolicy {
 };
 
 struct PredictorConfig {
+    // Master on/off switch for this predictor's OUTPUT. When false,
+    // IsPredictedCritical() unconditionally returns false, regardless of
+    // trained state -- but training and all table bookkeeping (hitCount,
+    // the rate governor's observed rate, etc.) still run exactly as
+    // normal underneath. This masks the verdict, it does not pause
+    // learning: flipping it back to true immediately benefits from
+    // whatever was learned while it was off. Intended for clean A/B
+    // comparison (is criticality-aware scheduling actually helping?) or
+    // live on/off toggling without discarding accumulated state or
+    // restarting the predictor.
+    bool enablePrediction = true;
+
     // log2 of the number of SETS in the training table and prediction
     // table (both PC-indexed). Total entries per table = (1 <<
     // ...Log2) * ...Ways.
@@ -234,11 +246,12 @@ public:
     void UpdateIssueqReadyWaitingTime(Addr producerPc, std::int64_t waitingTime);
 
     // Read-only prediction lookup. False (non-critical) for any PC with
-    // no trained entry yet.
+    // no trained entry yet, or unconditionally when
+    // PredictorConfig::enablePrediction is false (see its comment) --
+    // training and table bookkeeping (hitCount, the rate governor, etc.)
+    // still run normally underneath either way; only the value actually
+    // returned here is masked.
     bool IsPredictedCritical(Addr pc) const;
-
-    static std::int32_t PriorityBoost(bool predictedCritical,
-                                       std::int32_t boostMagnitude = 1);
 
     // Call once, typically right after construction, pointing each field
     // at counter storage the HOST already owns. See PredictorStatPointers.

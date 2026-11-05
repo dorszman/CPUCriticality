@@ -327,9 +327,11 @@ dimension to the matrix, bias the *existing* fields —
 
 The reference C++ module intentionally does not implement either reservation
 station style itself — reservation-station design is host-specific. It
-exposes `isPredictedCritical(pc)` and a `priorityBoost()` helper; the host
-model's own picker consumes that boolean/boost however its existing select
-logic is structured.
+exposes only `IsPredictedCritical(pc)`; the host model's own picker
+consumes that boolean however its existing select logic is structured
+(a mask for the shifting style, or `critical ? boost : 0` added to an
+existing age/priority field for the matrix style — a one-line
+conversion not worth a dedicated helper).
 
 ### 3.7 Optional extension: cache-retention hint
 
@@ -478,7 +480,7 @@ pipeline events essentially every OoO performance model already has:
 | Instruction decoded | `uop.token = engine.DecodeGetToken(pc);` (unconditional — usually returns empty), and, separately, `bool crit = engine.IsPredictedCritical(pc);` to tag the instruction for scheduling use |
 | Instruction executes / broadcasts result | see the sequence below — exactly once per instruction, alongside whatever the host's own wakeup/match logic already does on this broadcast |
 | Instruction squashed (branch mispredict, exception, etc.) | **no engine call at all** — just let the uop's `TokenRef` member be destroyed/reset as part of normal teardown; that alone releases any token it held (§8) |
-| Issue-queue select logic | `engine.IsPredictedCritical(pc)` (or the tag captured at fetch); combine with `TokenEngine::PriorityBoost(...)` per §3.6 |
+| Issue-queue select logic | `engine.IsPredictedCritical(pc)` (or the tag captured at fetch); use it per the masking/biasing patterns in §3.6 |
 
 The execute-time sequence, per §3.2/§3.3:
 
@@ -524,8 +526,10 @@ every counter is then a no-op write-sink.
 
 ## 6. Configuration knobs
 
-All exposed via `CriticalityConfig` (see header). Starting points to tune
-against your workload mix:
+Split across two structs per §3.9: `CriticalityConfig` (token-sampling
+knobs, plus a nested `predictor` field) and `PredictorConfig`
+(everything else below). Starting points to tune against your workload
+mix:
 
 - `tokenPoolSize`: trade-off between statistical sample rate and area/power.
 - `tokenAssignInterval`: sparsity of sampling; smaller = more samples, more
@@ -535,6 +539,11 @@ against your workload mix:
   regardless of pool occupancy; `true` instead grants a token to every
   decoded uop as long as a slot is free, letting pool scarcity alone
   throttle the rate (see §3.1).
+- `enablePrediction` (default `true`): master on/off switch for
+  `IsPredictedCritical()`'s returned verdict only -- training and all
+  table bookkeeping (hitCount, the rate governor) keep running normally
+  underneath regardless. For clean A/B comparison or live toggling
+  without discarding learned state or restarting the predictor.
 - `criticalDistanceCycles` / `nonCriticalDistanceCycles`: should bracket the
   expected "back-to-back, no slack" latency for your pipeline's bypass
   network (e.g. near 1–2 cycles for ALU-to-ALU forwarding) versus a distance

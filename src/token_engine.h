@@ -140,11 +140,6 @@ public:
     // S3.2/S3.3/S5/S8 for the exact sequence and why no separate flush
     // entry point is needed.
 
-    static std::int32_t PriorityBoost(bool predictedCritical,
-                                       std::int32_t boostMagnitude = 1) {
-        return CriticalityPredictor::PriorityBoost(predictedCritical, boostMagnitude);
-    }
-
     // Call once, typically right after construction, pointing each field
     // at counter storage the HOST already owns. See CriticalityStatPointers.
     // Safe to call with any subset of fields left null; safe to never
