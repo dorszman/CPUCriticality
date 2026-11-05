@@ -1,10 +1,28 @@
 #include "criticality_predictor.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 namespace ISQCrit {
 
@@ -123,6 +141,12 @@ public:
         entries_.assign(numSets_ * ways_, EntryT{});
         lastTouched_.assign(numSets_ * ways_, 0);
         setCounters_.assign(numSets_, 0);
+    }
+
+    // Next victim choice uses these. Entries already in the table stay.
+    void SetReplacement(EvictionPolicy policy, std::uint64_t decayIdleUnit) const {
+        policy_ = policy;
+        decayIdleUnit_ = decayIdleUnit;
     }
 
     // Read-only lookup: returns the matching entry, or nullptr on a
@@ -248,8 +272,8 @@ private:
     std::vector<EntryT> entries_;
     mutable std::vector<std::uint64_t> lastTouched_;
     mutable std::vector<std::uint64_t> setCounters_; // one per set, not table-wide
-    EvictionPolicy policy_ = EvictionPolicy::kDecayedPriorityThenLru;
-    std::uint64_t decayIdleUnit_ = 128;
+    mutable EvictionPolicy policy_ = EvictionPolicy::kDecayedPriorityThenLru;
+    mutable std::uint64_t decayIdleUnit_ = 128;
     std::size_t numSets_ = 1;
     unsigned ways_ = 1;
 };
@@ -280,6 +304,9 @@ struct CriticalityPredictor::Impl {
                 "PredictorConfig::criticalRateRelaxDwellWindows must be >= 1 when "
                 "enableCriticalRateGovernor is true");
         }
+        if (cfg.distanceClassInterval == 0) {
+            throw std::invalid_argument("PredictorConfig::distanceClassInterval must be >= 1");
+        }
 
         trainTable.Configure(cfg.trainingTableEntriesLog2, cfg.trainingTableWays,
                               cfg.trainingTableEvictionPolicy, cfg.trainingTableDecayIdleUnit);
@@ -291,6 +318,8 @@ struct CriticalityPredictor::Impl {
         // cfg.promoteCriticalAt and never updated when the governor is
         // disabled, so UpdateIssueqReadyWaitingTime() below can use this field unconditionally.
         promoteCriticalAtEffective = cfg.promoteCriticalAt;
+        rateWindowLimit = cfg.criticalRateControlInterval;
+        OpenTraceLog();
 
         // Logged once up front, including when the governor is off and
         // this value never moves. Later changes are logged from
@@ -301,18 +330,60 @@ struct CriticalityPredictor::Impl {
                          "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
                          kTraceLogPrefix, promoteCriticalAtEffective, 0.0,
                          static_cast<unsigned long long>(lookupCounter));
-            // Same threshold the counter compares against, logged as a
-            // positive magnitude so a graph can draw it upward. The
-            // stored counter still goes negative; only the trace does not.
-            std::int32_t demoteAt = cfg.promoteNonCriticalAt < 0
-                                        ? -cfg.promoteNonCriticalAt
-                                        : cfg.promoteNonCriticalAt;
+            // The signed level the counter compares against
+            // (promoteNonCriticalAt). Negative in the default config.
             std::fprintf(cfg.traceLogStream,
                          "%s table=train event=demote_threshold value=%d decode=%llu\n",
-                         kTraceLogPrefix, demoteAt,
+                         kTraceLogPrefix, cfg.promoteNonCriticalAt,
                          static_cast<unsigned long long>(lookupCounter));
             std::fflush(cfg.traceLogStream);
         }
+        StartLiveControl();
+    }
+
+    ~Impl() {
+        StopLiveControl();
+        if (ownedTrace_ != nullptr) {
+            std::fclose(ownedTrace_);
+            ownedTrace_ = nullptr;
+        }
+    }
+
+    // Empty a log the host already opened. A shell redirect with ">>"
+    // sets O_APPEND, and writes then ignore the file offset and stick
+    // the new run onto the old bytes. Clearing that flag, then
+    // truncating, makes the next line the first line. A terminal is
+    // left alone.
+    static void ClearTraceFile(std::FILE* stream) {
+        if (stream == nullptr) return;
+        std::fflush(stream);
+        int fd = ::fileno(stream);
+        if (fd < 0) return;
+        struct stat st;
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return;
+        int flags = ::fcntl(fd, F_GETFL);
+        if (flags >= 0 && (flags & O_APPEND) != 0) {
+            ::fcntl(fd, F_SETFL, flags & ~O_APPEND);
+        }
+        if (::ftruncate(fd, 0) != 0) return;
+        ::lseek(fd, 0, SEEK_SET);
+        std::fseek(stream, 0, SEEK_SET);
+    }
+
+    void OpenTraceLog() {
+        if (!cfg.enableTraceLog) return;
+        if (cfg.traceLogPath != nullptr && cfg.traceLogPath[0] != '\0') {
+            // Remove the previous run. Truncating the same inode leaves
+            // a reader parked at the old end of the file, so it never
+            // sees the new run as a new file.
+            ::unlink(cfg.traceLogPath);
+            ownedTrace_ = std::fopen(cfg.traceLogPath, "w");
+            if (ownedTrace_ == nullptr) {
+                throw std::runtime_error(std::string("could not open trace log ") + cfg.traceLogPath);
+            }
+            cfg.traceLogStream = ownedTrace_;
+        }
+        ClearTraceFile(cfg.traceLogStream);
     }
 
     // --- Training / prediction tables -----------------------------------
@@ -369,7 +440,9 @@ struct CriticalityPredictor::Impl {
     SetAssociativeTable<TrainEntry> trainTable;
     SetAssociativeTable<PredEntry> predTable;
 
-    PredictorConfig cfg;
+    // Mutable so a lookup, which is const to the caller, can apply a
+    // live-knob update that arrived on the control socket.
+    mutable PredictorConfig cfg;
     PredictorStatPointers statPtrs; // all null until SetupStats() is called
 
     // Local, predictor-owned call counter, used only as the "decode="
@@ -394,8 +467,50 @@ struct CriticalityPredictor::Impl {
     mutable std::uint32_t rateWindowHits = 0;
     mutable std::uint32_t rateWindowTotal = 0;
     mutable std::uint32_t rateGoodWindowStreak = 0; // see criticalRateRelaxDwellWindows
+    // Length of the window already open. A live change of
+    // criticalRateControlInterval takes effect on the next window.
+    mutable std::uint32_t rateWindowLimit = 1;
+
+    // Distance-class window. See PredictorConfig::distanceClassInterval.
+    // Counts every training sample, including the middle band that
+    // returns before the counter is touched. Reset after each logged
+    // window. Fixed length; a live distance-threshold update changes
+    // how later samples are classified, not the window length.
+    std::uint32_t classWindowCritical = 0;
+    std::uint32_t classWindowNonCritical = 0;
+    std::uint32_t classWindowNormal = 0;
+
+    void NoteDistanceClass(std::int64_t waitingTime) {
+        if (!cfg.enableTraceLog) return;
+        if (waitingTime <= cfg.criticalDistanceCycles) {
+            ++classWindowCritical;
+        } else if (waitingTime >= cfg.nonCriticalDistanceCycles) {
+            ++classWindowNonCritical;
+        } else {
+            ++classWindowNormal;
+        }
+        std::uint32_t total = classWindowCritical + classWindowNonCritical + classWindowNormal;
+        if (total < cfg.distanceClassInterval) return;
+        if (cfg.traceLogStream && total != 0) {
+            double inv = 1.0 / static_cast<double>(total);
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=distance_class criticalRatio=%.6f "
+                         "nonCriticalRatio=%.6f normalRatio=%.6f decode=%llu\n",
+                         kTraceLogPrefix,
+                         static_cast<double>(classWindowCritical) * inv,
+                         static_cast<double>(classWindowNonCritical) * inv,
+                         static_cast<double>(classWindowNormal) * inv,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
+        }
+        classWindowCritical = 0;
+        classWindowNonCritical = 0;
+        classWindowNormal = 0;
+    }
 
     void UpdateIssueqReadyWaitingTime(Addr producerPc, std::int64_t waitingTime) {
+        DrainLiveUpdates();
+        NoteDistanceClass(waitingTime);
         auto acq = trainTable.Acquire(producerPc);
         TrainEntry& e = acq.entry;
         TraceLogAcquire(cfg.enableTraceLog ? cfg.traceLogStream : nullptr, "train", acq.index,
@@ -447,6 +562,7 @@ struct CriticalityPredictor::Impl {
     }
 
     bool LookupPrediction(Addr pc) const {
+        DrainLiveUpdates();
         ++lookupCounter;
         auto found = predTable.Find(pc);
         // The REAL, unmasked verdict -- the governor calibrates and the
@@ -491,7 +607,7 @@ struct CriticalityPredictor::Impl {
     void UpdateRateGovernor(bool critical) const {
         ++rateWindowTotal;
         if (critical) ++rateWindowHits;
-        if (rateWindowTotal < cfg.criticalRateControlInterval) return;
+        if (rateWindowTotal < rateWindowLimit) return;
 
         double rate = static_cast<double>(rateWindowHits) / rateWindowTotal;
         std::int32_t before = promoteCriticalAtEffective;
@@ -519,6 +635,7 @@ struct CriticalityPredictor::Impl {
         }
         rateWindowHits = 0;
         rateWindowTotal = 0;
+        rateWindowLimit = cfg.criticalRateControlInterval;
     }
 
     void TraceLogHostStats(const HostTraceStats& stats) const {
@@ -528,6 +645,426 @@ struct CriticalityPredictor::Impl {
                      kTraceLogPrefix, static_cast<long long>(stats.ninst),
                      static_cast<unsigned long long>(lookupCounter));
         std::fflush(cfg.traceLogStream);
+    }
+
+    // --- Live knobs ------------------------------------------------------
+    struct LiveJob {
+        bool apply = false;
+        PredictorLiveConfig cfg;
+    };
+
+    mutable std::mutex liveMu_;
+    mutable std::deque<LiveJob> liveQueue_;
+    std::atomic<bool> liveStop_{false};
+    std::atomic<int> liveClientFd_{-1};
+    int liveListenFd_ = -1;
+    std::FILE* ownedTrace_ = nullptr;
+    std::string livePath_;
+    std::thread liveThread_;
+
+    static bool ParseI32(const std::string& s, std::int32_t& out) {
+        char* end = nullptr;
+        errno = 0;
+        long v = std::strtol(s.c_str(), &end, 10);
+        if (end == s.c_str() || *end != '\0' || errno != 0) return false;
+        if (v < std::numeric_limits<std::int32_t>::min() ||
+            v > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        out = static_cast<std::int32_t>(v);
+        return true;
+    }
+
+    static bool ParseU32(const std::string& s, std::uint32_t& out) {
+        char* end = nullptr;
+        errno = 0;
+        unsigned long v = std::strtoul(s.c_str(), &end, 10);
+        if (s.empty() || s[0] == '-' || end == s.c_str() || *end != '\0' || errno != 0) return false;
+        if (v > std::numeric_limits<std::uint32_t>::max()) return false;
+        out = static_cast<std::uint32_t>(v);
+        return true;
+    }
+
+    static bool ParseU64(const std::string& s, std::uint64_t& out) {
+        char* end = nullptr;
+        errno = 0;
+        unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+        if (s.empty() || s[0] == '-' || end == s.c_str() || *end != '\0' || errno != 0) return false;
+        out = static_cast<std::uint64_t>(v);
+        return true;
+    }
+
+    static bool ParseBool01(const std::string& s, bool& out) {
+        if (s == "0") { out = false; return true; }
+        if (s == "1") { out = true; return true; }
+        return false;
+    }
+
+    static bool ParseDouble01(const std::string& s, double& out) {
+        char* end = nullptr;
+        errno = 0;
+        double v = std::strtod(s.c_str(), &end);
+        if (end == s.c_str() || *end != '\0' || errno != 0) return false;
+        if (v < 0.0 || v > 1.0) return false;
+        out = v;
+        return true;
+    }
+
+    static bool ParsePolicy(const std::string& s, EvictionPolicy& out) {
+        if (s == "kLru") { out = EvictionPolicy::kLru; return true; }
+        if (s == "kDecayedHitCount") { out = EvictionPolicy::kDecayedHitCount; return true; }
+        if (s == "kDecayedPriorityThenLru") {
+            out = EvictionPolicy::kDecayedPriorityThenLru;
+            return true;
+        }
+        return false;
+    }
+
+    static const char* PolicyName(EvictionPolicy policy) {
+        switch (policy) {
+            case EvictionPolicy::kLru: return "kLru";
+            case EvictionPolicy::kDecayedHitCount: return "kDecayedHitCount";
+            case EvictionPolicy::kDecayedPriorityThenLru: return "kDecayedPriorityThenLru";
+        }
+        return "kLru";
+    }
+
+    static bool ParseLiveLine(const std::string& line, PredictorLiveConfig& out) {
+        std::istringstream in(line);
+        std::string tok;
+        std::map<std::string, std::string> kv;
+        while (in >> tok) {
+            if (!tok.empty() && tok.back() == '\r') tok.pop_back();
+            if (tok.empty()) continue;
+            auto eq = tok.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 == tok.size()) return false;
+            if (!kv.emplace(tok.substr(0, eq), tok.substr(eq + 1)).second) return false;
+        }
+        if (kv.size() != 16) return false;
+        PredictorLiveConfig parsed;
+        if (!ParseBool01(kv["enablePrediction"], parsed.enablePrediction)) return false;
+        if (!ParseI32(kv["criticalDistanceCycles"], parsed.criticalDistanceCycles)) return false;
+        if (!ParseI32(kv["nonCriticalDistanceCycles"], parsed.nonCriticalDistanceCycles)) return false;
+        if (!ParseI32(kv["promoteCriticalAt"], parsed.promoteCriticalAt)) return false;
+        if (!ParseI32(kv["promoteNonCriticalAt"], parsed.promoteNonCriticalAt)) return false;
+        if (!ParseI32(kv["trainCounterMin"], parsed.trainCounterMin)) return false;
+        if (!ParseI32(kv["trainCounterMax"], parsed.trainCounterMax)) return false;
+        if (!ParseBool01(kv["enableCriticalRateGovernor"], parsed.enableCriticalRateGovernor)) return false;
+        if (!ParseDouble01(kv["targetCriticalRate"], parsed.targetCriticalRate)) return false;
+        if (!ParseDouble01(kv["criticalRateDeadband"], parsed.criticalRateDeadband)) return false;
+        if (!ParseU32(kv["criticalRateControlInterval"], parsed.criticalRateControlInterval)) return false;
+        if (!ParseU32(kv["criticalRateRelaxDwellWindows"], parsed.criticalRateRelaxDwellWindows)) return false;
+        if (!ParsePolicy(kv["trainingTableEvictionPolicy"], parsed.trainingTableEvictionPolicy)) return false;
+        if (!ParsePolicy(kv["predictionTableEvictionPolicy"], parsed.predictionTableEvictionPolicy)) return false;
+        if (!ParseU64(kv["trainingTableDecayIdleUnit"], parsed.trainingTableDecayIdleUnit)) return false;
+        if (!ParseU64(kv["predictionTableDecayIdleUnit"], parsed.predictionTableDecayIdleUnit)) return false;
+        // operator[] inserts a missing key as "", which then fails to parse.
+        // A missing key also makes size != 16 only when no extra key replaces it.
+        // Reject a blank insertion by requiring every lookup to have been present:
+        // size is 16 and each Parse saw a real token. An absent key yields "" and fails.
+        out = parsed;
+        return LiveConfigOk(out);
+    }
+
+    static bool LiveConfigOk(const PredictorLiveConfig& live) {
+        if (live.trainCounterMin > live.trainCounterMax) return false;
+        if (live.criticalDistanceCycles > live.nonCriticalDistanceCycles) return false;
+        if (live.trainingTableDecayIdleUnit == 0 || live.predictionTableDecayIdleUnit == 0) return false;
+        if (live.targetCriticalRate < 0.0 || live.targetCriticalRate > 1.0) return false;
+        if (live.criticalRateDeadband < 0.0 || live.criticalRateDeadband > 1.0) return false;
+        if (live.enableCriticalRateGovernor &&
+            (live.criticalRateControlInterval == 0 || live.criticalRateRelaxDwellWindows == 0)) {
+            return false;
+        }
+        return true;
+    }
+
+    PredictorLiveConfig SnapshotLive() const {
+        PredictorLiveConfig s;
+        s.enablePrediction = cfg.enablePrediction;
+        s.criticalDistanceCycles = cfg.criticalDistanceCycles;
+        s.nonCriticalDistanceCycles = cfg.nonCriticalDistanceCycles;
+        s.promoteCriticalAt = cfg.promoteCriticalAt;
+        s.promoteNonCriticalAt = cfg.promoteNonCriticalAt;
+        s.trainCounterMin = cfg.trainCounterMin;
+        s.trainCounterMax = cfg.trainCounterMax;
+        s.enableCriticalRateGovernor = cfg.enableCriticalRateGovernor;
+        s.targetCriticalRate = cfg.targetCriticalRate;
+        s.criticalRateDeadband = cfg.criticalRateDeadband;
+        s.criticalRateControlInterval = cfg.criticalRateControlInterval;
+        s.criticalRateRelaxDwellWindows = cfg.criticalRateRelaxDwellWindows;
+        s.trainingTableEvictionPolicy = cfg.trainingTableEvictionPolicy;
+        s.predictionTableEvictionPolicy = cfg.predictionTableEvictionPolicy;
+        s.trainingTableDecayIdleUnit = cfg.trainingTableDecayIdleUnit;
+        s.predictionTableDecayIdleUnit = cfg.predictionTableDecayIdleUnit;
+        return s;
+    }
+
+    void DumpLive() const {
+        if (!cfg.enableTraceLog || !cfg.traceLogStream) return;
+        PredictorLiveConfig s = SnapshotLive();
+        std::fprintf(cfg.traceLogStream,
+                     "%s table=live enablePrediction=%d criticalDistanceCycles=%d "
+                     "nonCriticalDistanceCycles=%d promoteCriticalAt=%d promoteNonCriticalAt=%d "
+                     "trainCounterMin=%d trainCounterMax=%d enableCriticalRateGovernor=%d "
+                     "targetCriticalRate=%.6f criticalRateDeadband=%.6f "
+                     "criticalRateControlInterval=%u criticalRateRelaxDwellWindows=%u "
+                     "trainingTableEvictionPolicy=%s predictionTableEvictionPolicy=%s "
+                     "trainingTableDecayIdleUnit=%llu predictionTableDecayIdleUnit=%llu "
+                     "decode=%llu\n",
+                     kTraceLogPrefix,
+                     s.enablePrediction ? 1 : 0,
+                     s.criticalDistanceCycles,
+                     s.nonCriticalDistanceCycles,
+                     s.promoteCriticalAt,
+                     s.promoteNonCriticalAt,
+                     s.trainCounterMin,
+                     s.trainCounterMax,
+                     s.enableCriticalRateGovernor ? 1 : 0,
+                     s.targetCriticalRate,
+                     s.criticalRateDeadband,
+                     s.criticalRateControlInterval,
+                     s.criticalRateRelaxDwellWindows,
+                     PolicyName(s.trainingTableEvictionPolicy),
+                     PolicyName(s.predictionTableEvictionPolicy),
+                     static_cast<unsigned long long>(s.trainingTableDecayIdleUnit),
+                     static_cast<unsigned long long>(s.predictionTableDecayIdleUnit),
+                     static_cast<unsigned long long>(lookupCounter));
+        std::fflush(cfg.traceLogStream);
+    }
+
+    void ApplyLiveNow(const PredictorLiveConfig& live) const {
+        bool governorWasOn = cfg.enableCriticalRateGovernor;
+        std::int32_t effectiveBefore = promoteCriticalAtEffective;
+        std::int32_t demoteBefore = cfg.promoteNonCriticalAt;
+        cfg.enablePrediction = live.enablePrediction;
+        cfg.criticalDistanceCycles = live.criticalDistanceCycles;
+        cfg.nonCriticalDistanceCycles = live.nonCriticalDistanceCycles;
+        cfg.promoteCriticalAt = live.promoteCriticalAt;
+        cfg.promoteNonCriticalAt = live.promoteNonCriticalAt;
+        cfg.trainCounterMin = live.trainCounterMin;
+        cfg.trainCounterMax = live.trainCounterMax;
+        cfg.enableCriticalRateGovernor = live.enableCriticalRateGovernor;
+        cfg.targetCriticalRate = live.targetCriticalRate;
+        cfg.criticalRateDeadband = live.criticalRateDeadband;
+        cfg.criticalRateControlInterval = live.criticalRateControlInterval;
+        cfg.criticalRateRelaxDwellWindows = live.criticalRateRelaxDwellWindows;
+        cfg.trainingTableEvictionPolicy = live.trainingTableEvictionPolicy;
+        cfg.predictionTableEvictionPolicy = live.predictionTableEvictionPolicy;
+        cfg.trainingTableDecayIdleUnit = live.trainingTableDecayIdleUnit;
+        cfg.predictionTableDecayIdleUnit = live.predictionTableDecayIdleUnit;
+        trainTable.SetReplacement(live.trainingTableEvictionPolicy, live.trainingTableDecayIdleUnit);
+        predTable.SetReplacement(live.predictionTableEvictionPolicy, live.predictionTableDecayIdleUnit);
+
+        if (!cfg.enableCriticalRateGovernor || !governorWasOn) {
+            // Off, or just turned on: drop the open window. The new
+            // interval applies to the window that starts now.
+            rateWindowHits = 0;
+            rateWindowTotal = 0;
+            rateGoodWindowStreak = 0;
+            rateWindowLimit = cfg.criticalRateControlInterval;
+            if (!cfg.enableCriticalRateGovernor) {
+                promoteCriticalAtEffective = cfg.promoteCriticalAt;
+            }
+        }
+        if (promoteCriticalAtEffective < cfg.promoteCriticalAt) {
+            promoteCriticalAtEffective = cfg.promoteCriticalAt;
+        }
+        if (promoteCriticalAtEffective > cfg.trainCounterMax) {
+            promoteCriticalAtEffective = cfg.trainCounterMax;
+        }
+        // A lower max (or a higher floor) moves the threshold even when
+        // the governor's next window would not. Without this line the
+        // chart keeps the old value and then looks frozen, because a
+        // threshold already sitting on the new max does not move again
+        // until the rate falls under the cap.
+        if (cfg.enableTraceLog && cfg.traceLogStream &&
+            promoteCriticalAtEffective != effectiveBefore) {
+            double rate = rateWindowTotal == 0
+                              ? 0.0
+                              : static_cast<double>(rateWindowHits) / rateWindowTotal;
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
+                         kTraceLogPrefix, promoteCriticalAtEffective, rate,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
+        }
+        if (cfg.enableTraceLog && cfg.traceLogStream &&
+            cfg.promoteNonCriticalAt != demoteBefore) {
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=demote_threshold value=%d decode=%llu\n",
+                         kTraceLogPrefix, cfg.promoteNonCriticalAt,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
+        }
+        DumpLive();
+    }
+
+    void DrainLiveUpdates() const {
+        std::deque<LiveJob> batch;
+        {
+            std::lock_guard<std::mutex> lock(liveMu_);
+            batch.swap(liveQueue_);
+        }
+        for (const LiveJob& job : batch) {
+            if (job.apply && LiveConfigOk(job.cfg)) ApplyLiveNow(job.cfg);
+            else DumpLive();
+        }
+    }
+
+    bool ApplyFromSimThread(const PredictorLiveConfig& live) {
+        DrainLiveUpdates();
+        if (!LiveConfigOk(live)) {
+            DumpLive();
+            return false;
+        }
+        ApplyLiveNow(live);
+        return true;
+    }
+
+    static void WriteReply(int fd, const char* text) {
+        std::size_t left = std::strlen(text);
+        const char* p = text;
+        while (left > 0) {
+            ssize_t n = ::send(fd, p, left, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return;
+            }
+            p += n;
+            left -= static_cast<std::size_t>(n);
+        }
+    }
+
+    void EnqueueLive(LiveJob job) {
+        std::lock_guard<std::mutex> lock(liveMu_);
+        if (liveQueue_.size() >= 32) return;
+        liveQueue_.push_back(std::move(job));
+    }
+
+    void HandleControlLine(int fd, const std::string& line) {
+        PredictorLiveConfig parsed;
+        if (!ParseLiveLine(line, parsed)) {
+            WriteReply(fd, "rejected\n");
+            LiveJob job;
+            job.apply = false;
+            EnqueueLive(std::move(job));
+            return;
+        }
+        LiveJob job;
+        job.apply = true;
+        job.cfg = parsed;
+        {
+            std::lock_guard<std::mutex> lock(liveMu_);
+            if (liveQueue_.size() >= 32) {
+                WriteReply(fd, "rejected\n");
+                return;
+            }
+            liveQueue_.push_back(std::move(job));
+        }
+        WriteReply(fd, "queued\n");
+    }
+
+    void ServeControlClient(int fd) {
+        std::string buf;
+        char tmp[256];
+        while (!liveStop_.load()) {
+            pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int pr = ::poll(&pfd, 1, 200);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) continue;
+            ssize_t n = ::read(fd, tmp, sizeof tmp);
+            if (n <= 0) break;
+            buf.append(tmp, tmp + n);
+            for (;;) {
+                auto nl = buf.find('\n');
+                if (nl == std::string::npos) {
+                    if (buf.size() > 4096) {
+                        WriteReply(fd, "rejected\n");
+                        buf.clear();
+                    }
+                    break;
+                }
+                std::string line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                HandleControlLine(fd, line);
+            }
+        }
+    }
+
+    void ControlLoop() {
+        while (!liveStop_.load()) {
+            int fd = ::accept(liveListenFd_, nullptr, nullptr);
+            if (fd < 0) {
+                if (liveStop_.load()) break;
+                if (errno == EINTR) continue;
+                break;
+            }
+            liveClientFd_.store(fd);
+            ServeControlClient(fd);
+            int cur = fd;
+            if (liveClientFd_.compare_exchange_strong(cur, -1)) ::close(fd);
+        }
+    }
+
+    void StartLiveControl() {
+        if (!cfg.enableTraceLog || !cfg.traceLogStream) return;
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        static std::atomic<std::uint32_t> seq{0};
+        livePath_ = "/tmp/isqcrit-" + std::to_string(::getpid()) + "-" +
+                    std::to_string(seq.fetch_add(1)) + ".sock";
+        ::unlink(livePath_.c_str());
+        sockaddr_un addr;
+        std::memset(&addr, 0, sizeof addr);
+        addr.sun_family = AF_UNIX;
+        if (livePath_.size() >= sizeof addr.sun_path) {
+            ::close(fd);
+            livePath_.clear();
+            return;
+        }
+        std::memcpy(addr.sun_path, livePath_.c_str(), livePath_.size() + 1);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
+            ::listen(fd, 1) != 0) {
+            ::close(fd);
+            ::unlink(livePath_.c_str());
+            livePath_.clear();
+            return;
+        }
+        ::chmod(livePath_.c_str(), 0600);
+        liveListenFd_ = fd;
+        std::fprintf(cfg.traceLogStream,
+                     "%s table=control path=%s decode=%llu\n",
+                     kTraceLogPrefix, livePath_.c_str(),
+                     static_cast<unsigned long long>(lookupCounter));
+        std::fflush(cfg.traceLogStream);
+        DumpLive();
+        liveThread_ = std::thread([this] { ControlLoop(); });
+    }
+
+    void StopLiveControl() {
+        liveStop_.store(true);
+        int client = liveClientFd_.exchange(-1);
+        if (client >= 0) {
+            ::shutdown(client, SHUT_RDWR);
+            ::close(client);
+        }
+        if (liveListenFd_ >= 0) {
+            ::shutdown(liveListenFd_, SHUT_RDWR);
+            ::close(liveListenFd_);
+            liveListenFd_ = -1;
+        }
+        if (liveThread_.joinable()) liveThread_.join();
+        if (!livePath_.empty()) {
+            ::unlink(livePath_.c_str());
+            livePath_.clear();
+        }
     }
 };
 
@@ -550,6 +1087,10 @@ void CriticalityPredictor::SetupStats(const PredictorStatPointers& counters) {
 
 void CriticalityPredictor::TraceLogHostStats(const HostTraceStats& stats) {
     impl_->TraceLogHostStats(stats);
+}
+
+bool CriticalityPredictor::ApplyLiveConfig(const PredictorLiveConfig& live) {
+    return impl_->ApplyFromSimThread(live);
 }
 
 } // namespace ISQCrit

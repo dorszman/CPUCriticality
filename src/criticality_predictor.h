@@ -115,6 +115,20 @@ struct PredictorConfig {
     // thresholds are treated as ambiguous and do not update training.
     std::int32_t nonCriticalDistanceCycles = 8;
 
+    // How many UpdateIssueqReadyWaitingTime samples make one
+    // distance-class window. Every sample is one uop and falls in
+    // exactly one group, using the live thresholds at that sample:
+    // Critical when waitingTime <= criticalDistanceCycles, NonCritical
+    // when waitingTime >= nonCriticalDistanceCycles, Normal when it is
+    // strictly between (the middle band that does not train the
+    // counter). Normal is counted, not skipped. When the window fills,
+    // tracing logs Critical/Total, NonCritical/Total, and
+    // Normal/Total (they sum to 1) and the next window starts. Total
+    // is the sum of the three counts. Not a live knob and not part of
+    // PredictorLiveConfig. Must be >= 1 -- the constructor throws
+    // std::invalid_argument if it is 0.
+    std::uint32_t distanceClassInterval = 1024;
+
     // Saturating range for the per-PC training counter.
     std::int32_t trainCounterMin = -10;
     std::int32_t trainCounterMax = 40;
@@ -199,22 +213,32 @@ struct PredictorConfig {
     // consumer (see tools/visualize_trace.py) can pull these lines out
     // unambiguously even if something else writes to the same stream.
     // Disabled by default; zero cost when disabled beyond the branch
-    // itself.
+    // itself. When enabled, the predictor also listens for live-knob
+    // updates (see PredictorLiveConfig) and writes the socket path into
+    // this same stream. The switch and the stream stay fixed for the
+    // life of the predictor.
     bool enableTraceLog = false;
 
-    // Where enableTraceLog's lines go. Defaults to stdout, but a host
-    // that itself prints a lot of unrelated volume to stdout should
-    // point this at a dedicated FILE* instead (e.g. fopen() a separate
-    // trace file and hand it in here) -- this predictor never opens,
-    // closes, or otherwise owns this stream; exactly like
-    // PredictorStatPointers, the host owns the resource and this
-    // predictor only ever writes through it. Each line is fflush()'d
-    // individually (never a stream-wide buffering-mode change, which
-    // would affect everything else written to the same stream too) so
-    // a live consumer tailing it sees lines promptly; this flush cost
-    // is scoped to exactly this stream and only while enableTraceLog
-    // is on.
+    // Where enableTraceLog's lines go when traceLogPath is null. Defaults
+    // to stdout. The predictor does not own this stream: it only writes
+    // through it. If that stream is a regular file, including stdout
+    // redirected or appended onto a log, the predictor truncates it at
+    // startup so the new run replaces the previous one. A terminal is
+    // not truncated. Each line is fflush()'d individually (never a
+    // stream-wide buffering-mode change, which would affect everything
+    // else written to the same stream too) so a live consumer tailing it
+    // sees lines promptly; this flush cost is scoped to exactly this
+    // stream and only while enableTraceLog is on.
     std::FILE* traceLogStream = stdout;
+
+    // File the predictor itself opens when enableTraceLog is on. The
+    // previous file is removed first, then a new empty file is created,
+    // so a new run does not keep the previous run and a reader is not
+    // left at the old end of the same inode. The predictor owns that
+    // stream and closes it on destruction; traceLogStream is then the
+    // file it opened. Null leaves traceLogStream as the host supplied
+    // it, and a regular file there is truncated (append mode included).
+    const char* traceLogPath = nullptr;
 };
 
 // The counter width/type lives in exactly one place. Change it here (e.g.
@@ -241,6 +265,28 @@ struct PredictorStatPointers {
 // x-axis with the training and prediction lines.
 struct HostTraceStats {
     std::int64_t ninst = 0; // retired instructions
+};
+
+// One snapshot of the knobs that may change while the model is running
+// (docs/DESIGN.md §6.1). Every field is part of the update. An illegal
+// combination is refused and the knobs already in effect stay.
+struct PredictorLiveConfig {
+    bool enablePrediction = true;
+    std::int32_t criticalDistanceCycles = 2;
+    std::int32_t nonCriticalDistanceCycles = 8;
+    std::int32_t promoteCriticalAt = 5;
+    std::int32_t promoteNonCriticalAt = -3;
+    std::int32_t trainCounterMin = -10;
+    std::int32_t trainCounterMax = 40;
+    bool enableCriticalRateGovernor = true;
+    double targetCriticalRate = 0.10;
+    double criticalRateDeadband = 0.01;
+    std::uint32_t criticalRateControlInterval = 1024;
+    std::uint32_t criticalRateRelaxDwellWindows = 4;
+    EvictionPolicy trainingTableEvictionPolicy = EvictionPolicy::kLru;
+    EvictionPolicy predictionTableEvictionPolicy = EvictionPolicy::kDecayedPriorityThenLru;
+    std::uint64_t trainingTableDecayIdleUnit = 128;
+    std::uint64_t predictionTableDecayIdleUnit = 128;
 };
 
 class CriticalityPredictor {
@@ -288,6 +334,20 @@ public:
     // predictor never interprets the fields. Safe to call at any rate
     // the host finds convenient.
     void TraceLogHostStats(const HostTraceStats& stats);
+
+    // Apply one live update on the simulation thread. Returns false
+    // when the combination is illegal (counter min above max, critical
+    // distance above non-critical distance, a decay unit of 0, a
+    // governor interval or dwell of 0 while the governor is on, or a
+    // rate outside 0..1); the running knobs stay as they were.
+    // Learned table entries are left in place.
+    //
+    // With enableTraceLog, a viewer can send the same struct over the
+    // Unix socket named in the trace (`table=control path=...`). That
+    // update is applied at the start of the next train or lookup, and
+    // the values then in effect are written back as `table=live` with
+    // these field names.
+    bool ApplyLiveConfig(const PredictorLiveConfig& live);
 
 private:
     struct Impl;

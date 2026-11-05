@@ -250,6 +250,14 @@ directly from `TokenEngine::UpdateCriticality` (measurement closed) — see
   - `distance >= nonCriticalDistanceCycles` → decrement the counter
     (evidence toward "non-critical").
   - Otherwise (ambiguous middle zone) → leave the counter unchanged.
+- Every sample, including that middle zone, is also counted in a fixed
+  window of `distanceClassInterval` samples (default 1024; not a live
+  knob). Critical is `waitingTime <= criticalDistanceCycles`,
+  NonCritical is `waitingTime >= nonCriticalDistanceCycles`, and Normal
+  is strictly between them. When the window fills, the trace logs one
+  `table=train` line with the ratios Critical/Total, NonCritical/Total,
+  and Normal/Total (they sum to 1), then the next window starts.
+  Classification uses the thresholds in effect for that sample.
 - The counter saturates within a small signed range (reference default:
   `[-4, +3]`). This hysteresis is deliberate and important: a single sample
   must not flip a prediction. The predictor needs *repeated* evidence
@@ -561,9 +569,37 @@ and `traceLogStream` are not in this set.
 Fixed for the life of the process: table geometry
 (`trainingTableEntriesLog2`, `predictionTableEntriesLog2`,
 `trainingTableWays`, `predictionTableWays`), `tokenPoolSize`,
-`tokenAssignInterval`, `pureAvailabilityGating`, `enableTraceLog`, and
-`traceLogStream`. A different table size or token pool is a new
-predictor.
+`tokenAssignInterval`, `pureAvailabilityGating`, `enableTraceLog`,
+`traceLogStream`, `traceLogPath`, and `distanceClassInterval`. When
+tracing is on, the predictor clears the log before the first line. A `traceLogPath` is
+removed and created empty, so the new run is a new file. If the path is null, a regular file already
+open as `traceLogStream` (stdout redirected or appended onto the log)
+is truncated, and append mode is turned off. A terminal is left alone. A different table
+size or token pool is a new predictor.
+
+### 6.2 Live control channel
+
+When `enableTraceLog` is on, the predictor binds a Unix-domain socket
+and writes its path into the trace:
+
+```
+@@ISQCRIT@@ table=control path=/tmp/isqcrit-<pid>-<n>.sock decode=0
+```
+
+It also writes the knobs it is using, once at startup and again after
+every applied update, on the same lookup-count x-axis:
+
+```
+@@ISQCRIT@@ table=live enablePrediction=1 criticalDistanceCycles=2 ... decode=N
+```
+
+The field names are the `PredictorLiveConfig` fields. The viewer reads
+`path`, connects, and sends one line containing every live field
+whenever a control changes. The reply is `queued` or `rejected`. A
+rejected line leaves the running knobs unchanged. A queued line is
+applied on the simulation thread at the start of the next train or
+lookup, and the following `table=live` line is what the graph draws.
+The socket is removed when the predictor is destroyed.
 
 Starting points for the knobs above:
 
@@ -616,6 +652,31 @@ Starting points for the knobs above:
   fixed threshold. The baseline defaults leave 35 steps between
   `promoteCriticalAt` (5) and `trainCounterMax` (40) — see the warning
   in §3.8.
+
+### 6.3 What the trace viewer draws
+
+`tools/visualize_trace.py` plots the `@@ISQCRIT@@` log. The x-axis of
+every chart is the lookup count (`decode`). A new PC taking a slot
+is an orange tick on that chart's x-axis.
+The defaults demo does not fill `ninst`; that line stays empty unless
+the host calls `TraceLogHostStats`.
+
+| Chart | Stat | What it counts |
+| --- | --- | --- |
+| Training, selected slot, counter | counter | The signed training counter, positive and negative |
+| Training, selected slot, counter | effective promote threshold | Counter level required to promote. The rate governor can raise it |
+| Training, selected slot, counter | demote threshold | Where demotion starts. The counter keeps moving past it |
+| Training, selected slot, counter | counter minimum | Lowest value the counter can reach (`trainCounterMin`) |
+| Training, selected slot | cumulative promotes / demotes | Running totals for that slot |
+| Training, selected slot | ninst | Retired instructions, filled in by the host |
+| Criticality table | Critical/Total | Share of waits at or below `criticalDistanceCycles` |
+| Criticality table | Normal/Total | Share of waits strictly between the two distance thresholds |
+| Criticality table | NonCritical/Total | Share of waits at or above `nonCriticalDistanceCycles` |
+| Criticality table | Criticality | Fraction of all lookups predicted critical |
+| Prediction, selected slot | cumulative critical count / cumulative non-critical count | Running totals of predicted-critical and predicted-non-critical samples |
+| Prediction, selected slot | cumulative hit count | Hit count that keeps climbing across new allocations |
+| Prediction, selected slot | ninst | Same host retired-instruction count |
+| Live knobs | one row per knob | The value the model is actually using, labeled when it changes |
 
 ---
 

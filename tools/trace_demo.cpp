@@ -18,14 +18,11 @@
 // Build: g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/criticality_predictor.cpp src/token.cpp -o trace_demo
 //
 // Run, trace lines on the demo's own stdout (fine here since this demo
-// prints nothing else; a real host that dumps its own unrelated volume
-// to stdout should use the second form instead):
-//   ./trace_demo > /tmp/trace.log
+// prints nothing else):
+//   ./trace_demo
 //
-// Run with trace lines going to their own dedicated file instead (see
-// PredictorConfig::traceLogStream) -- this demo's stdout stays free for
-// whatever else a real host would print there, and the log consumer
-// only ever reads the dedicated file, never a shared stream:
+// Run with the predictor opening a dedicated file. It truncates that
+// file itself, so a new run does not keep the previous one:
 //   ./trace_demo /tmp/trace.log
 //
 // Either way: python3 tools/visualize_trace.py /tmp/trace.log
@@ -66,8 +63,6 @@ void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance, std::
 } // namespace
 
 int main(int argc, char** argv) {
-    std::FILE* traceFile = nullptr; // only used/closed if a path was given
-
     CriticalityConfig cfg;
     cfg.tokenAssignInterval = 1;
     cfg.predictor.criticalDistanceCycles = 2;
@@ -100,16 +95,8 @@ int main(int argc, char** argv) {
 
     cfg.predictor.enableTraceLog = true;
     if (argc > 1) {
-        // Dedicated trace file, opened and owned by this host (the demo
-        // standing in for a real CA model) -- the predictor only ever
-        // writes through cfg.predictor.traceLogStream, never opens or
-        // closes it.
-        traceFile = std::fopen(argv[1], "w");
-        if (!traceFile) {
-            std::fprintf(stderr, "could not open '%s' for trace output\n", argv[1]);
-            return 1;
-        }
-        cfg.predictor.traceLogStream = traceFile;
+        // The predictor opens this path with truncation when it starts.
+        cfg.predictor.traceLogPath = argv[1];
     }
 
     TokenEngine engine(cfg);
@@ -136,6 +123,5 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (traceFile) std::fclose(traceFile);
     return 0;
 }
