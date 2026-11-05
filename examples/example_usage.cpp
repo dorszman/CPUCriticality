@@ -56,10 +56,10 @@ int main() {
     CriticalityConfig cfg;
     cfg.tokenPoolSize = 4;
     cfg.tokenAssignInterval = 1; // tag every decoded uop, for a dense demo
-    cfg.criticalDistanceCycles = 1;
-    cfg.nonCriticalDistanceCycles = 4;
-    cfg.promoteCriticalAt = 1;
-    cfg.promoteNonCriticalAt = -1;
+    cfg.predictor.criticalDistanceCycles = 1;
+    cfg.predictor.nonCriticalDistanceCycles = 4;
+    cfg.predictor.promoteCriticalAt = 1;
+    cfg.predictor.promoteNonCriticalAt = -1;
 
     TokenEngine engine(cfg);
 
@@ -72,9 +72,9 @@ int main() {
     CriticalityStatPointers hostCounters;
     hostCounters.tokensAssigned = &tokensAssigned;
     hostCounters.tokensExpired = &tokensExpired;
-    hostCounters.trainingEvents = &trainingEvents;
-    hostCounters.criticalPromotions = &criticalPromotions;
-    hostCounters.nonCriticalPromotions = &nonCriticalPromotions;
+    hostCounters.predictor.trainingEvents = &trainingEvents;
+    hostCounters.predictor.criticalPromotions = &criticalPromotions;
+    hostCounters.predictor.nonCriticalPromotions = &nonCriticalPromotions;
     engine.SetupStats(hostCounters);
 
     // Toy versions of the host's own structures -- none of this is known

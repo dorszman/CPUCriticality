@@ -383,6 +383,48 @@ cap. This project's own baseline defaults (`promoteCriticalAt=2`,
 well above `promoteCriticalAt` specifically when enabling this
 governor.
 
+### 3.9 Two-layer architecture: sampling strategy vs. the predictor itself
+
+Everything in §§3.1-3.3 (the token pool, epoch guard, fan-out racing) is
+a **sampling strategy** — a way to afford measuring only a sparse,
+budget-bounded subset of dynamic instructions. Everything in §§3.4-3.8
+(the training/prediction tables, eviction policies, the rate governor)
+is the **learning mechanism** — how a stream of `(producer PC, waiting
+time)` samples turns into predictions. These are two genuinely
+independent concerns, reflected directly in the code as two classes:
+
+- **`CriticalityPredictor`** (`criticality_predictor.h/.cpp`) owns the
+  training/prediction tables and everything in §§3.4-3.8. It has no
+  concept of tokens, epochs, or sampling at all — its entire public
+  surface is `UpdateIssueqReadyWaitingTime(producerPc, waitingTime)`
+  (feed one sample, however it was obtained) and
+  `IsPredictedCritical(pc)`. Its own config (`PredictorConfig`) holds
+  everything in §6 below except the three token-sampling knobs.
+- **`TokenEngine`** (`token_engine.h/.cpp`) owns only the token pool and
+  `Token` lifecycle described in §§3.1-3.3, and holds a
+  `CriticalityPredictor` internally: `UpdateCriticality()` computes the
+  closed measurement's waiting time and forwards it with one call;
+  `IsPredictedCritical()` is a pure pass-through. `CriticalityConfig`
+  (what a `TokenEngine` host constructs) is `tokenPoolSize` +
+  `tokenAssignInterval` + `pureAvailabilityGating` plus a nested
+  `PredictorConfig predictor` field.
+
+**Why this split matters in practice**: a host can drive
+`CriticalityPredictor` directly, with no `TokenEngine` and no token pool
+at all, by calling `UpdateIssueqReadyWaitingTime()` for *every* dynamic
+instruction instead of only the sparse subset a token pool would sample
+— an "ideal," unbounded-budget mode useful as an oracle/upper-bound
+reference to measure how much accuracy the real, budget-constrained
+`TokenEngine` gives up to sampling. It is **not** a mode intended for
+actual deployment (unbounded per-instruction tracking defeats the
+entire cost-bounding purpose of this mechanism in the first place — see
+§3.1) — it exists purely as a comparison baseline. When building such a
+comparison, feed the **minimum** waiting time across a producer's
+fan-out per broadcast, not one independent sample per consumer, or the
+comparison measures "smart vs. dumb aggregation" rather than "sampled
+vs. exhaustive," since §3.3's fastest-wins racing already does the
+former for the token-based path.
+
 ---
 
 ## 4. Data structures (reference sizes — tune for your target)

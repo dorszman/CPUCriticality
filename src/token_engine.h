@@ -1,7 +1,9 @@
-// TokenEngine: the token-passing dynamic criticality predictor itself.
-// Owns the token pool and the PC-indexed training/prediction tables. See
-// docs/DESIGN.md for the full mechanism and the exact host integration
-// contract.
+// TokenEngine: the budget-constrained TOKEN SAMPLING layer sitting on
+// top of CriticalityPredictor. Owns the token pool and the Token
+// lifecycle (epoch/refcount/fan-out racing); delegates all actual
+// training/prediction to an internal CriticalityPredictor instance,
+// which has no idea tokens exist at all -- see criticality_predictor.h
+// and docs/DESIGN.md.
 //
 // This header is self-contained (C++17, standard library only) and has no
 // dependency on any particular simulator's internal types. Notably, it
@@ -15,39 +17,12 @@
 #pragma once
 
 #include "token.h"
+#include "criticality_predictor.h"
 
 #include <cstddef>
 #include <cstdint>
 
 namespace ISQCrit {
-
-// How a set-associative table picks a victim once a set is full. Shared
-// by the training and prediction tables, though only the training
-// table's choice is exposed as a config knob (see
-// CriticalityConfig::trainingTableEvictionPolicy below) -- the
-// prediction table's policy is fixed, already validated, and not
-// something this project currently has evidence to make configurable.
-enum class EvictionPolicy {
-    // Pure least-recently-used: whichever way in the set was touched
-    // longest ago loses, full stop. Ignores any confidence/frequency
-    // signal an entry may carry. The simplest, safest choice -- no
-    // staleness math, nothing to calibrate.
-    kLru,
-
-    // Evict by lowest decayed access-frequency counter (see
-    // DecayedPriority in token_engine.cpp), with NO recency tiebreak at
-    // all -- ties are broken by fixed way order, not by lastTouched_.
-    // Protects frequently-(re)trained entries from eviction by a
-    // merely-more-recent one-off, but a long-idle entry's advantage
-    // still erodes on its own as ITS set sees more traffic, so nothing
-    // earns permanent protection.
-    kDecayedHitCount,
-
-    // Decayed priority first, least-recently-used only as a tiebreak
-    // among exactly equal (decayed) priorities. The prediction table's
-    // fixed policy; also selectable for the training table if wanted.
-    kDecayedPriorityThenLru,
-};
 
 struct CriticalityConfig {
     // Number of simultaneously in-flight tokens. Small by design: this
@@ -55,50 +30,6 @@ struct CriticalityConfig {
     // pool. Must be >= 1 -- TokenEngine's constructor throws
     // std::invalid_argument if it is 0.
     unsigned tokenPoolSize = 8;
-
-    // log2 of the number of SETS in the training table and prediction
-    // table (both PC-indexed). Total entries per table = (1 <<
-    // ...Log2) * ...Ways.
-    unsigned trainingTableEntriesLog2 = 10;
-    unsigned predictionTableEntriesLog2 = 10;
-
-    // Ways per set. 1 (the default) reproduces the original direct-mapped
-    // design exactly: two PCs that hash to the same set unconditionally
-    // evict each other. >1 adds associativity -- both PCs can coexist in
-    // the same set (up to 'ways' of them) instead of aliasing, at the
-    // cost of searching every way on each lookup and needing a
-    // replacement policy (LRU within the set) once a set is full. Must
-    // be >= 1 -- TokenEngine's constructor throws std::invalid_argument
-    // if either is 0.
-    unsigned trainingTableWays = 1;
-    unsigned predictionTableWays = 1;
-
-    // Which policy the training table uses to pick a victim once a set
-    // is full (only matters when trainingTableWays > 1 and a set is
-    // actually full). A deliberate either/or choice between two
-    // well-understood, non-overlapping policies -- not a numeric
-    // threshold to calibrate. Defaults to the simplest option.
-    EvictionPolicy trainingTableEvictionPolicy = EvictionPolicy::kLru;
-
-    // Same choice, for the prediction table (only matters when
-    // predictionTableWays > 1). Defaults to kDecayedPriorityThenLru --
-    // consulted heavily via IsPredictedCritical() on every fetch, so
-    // unlike the training table, decayed usefulness (with LRU only as a
-    // tiebreak) rather than plain LRU is the validated starting point
-    // here.
-    EvictionPolicy predictionTableEvictionPolicy = EvictionPolicy::kDecayedPriorityThenLru;
-
-    // How many idle accesses to an entry's own set correspond to one
-    // halving of its eviction priority, for each table's decay-based
-    // policy (training table: only when trainingTableEvictionPolicy ==
-    // kDecayedHitCount; prediction table: always, its policy is fixed
-    // at kDecayedPriorityThenLru). Below this many idle accesses, an
-    // entry hasn't decayed at all. Separate per table since the two
-    // tables typically see very different access patterns/contention.
-    // Both must be >= 1 -- TokenEngine's constructor throws
-    // std::invalid_argument if either is 0 (used as a divisor).
-    std::uint64_t trainingTableDecayIdleUnit = 128;
-    std::uint64_t predictionTableDecayIdleUnit = 128;
 
     // Default sampling policy (matches the original mechanism): a token
     // is assigned on average once every tokenAssignInterval decoded
@@ -121,109 +52,16 @@ struct CriticalityConfig {
     // statistics (see docs/DESIGN.md).
     bool pureAvailabilityGating = false;
 
-    // Distance (in cycles) at or below which a measured producer/consumer
-    // edge counts as evidence toward "critical".
-    std::int32_t criticalDistanceCycles = 2;
-
-    // Distance (in cycles) at or above which a measured edge counts as
-    // evidence toward "non-critical". Distances strictly between the two
-    // thresholds are treated as ambiguous and do not update training.
-    std::int32_t nonCriticalDistanceCycles = 8;
-
-    // Saturating range for the per-PC training counter.
-    std::int32_t trainCounterMin = -4;
-    std::int32_t trainCounterMax = 3;
-
-    // Training-counter thresholds at which a PC is (re-)promoted into the
-    // prediction table as critical / non-critical.
-    std::int32_t promoteCriticalAt = 2;
-    std::int32_t promoteNonCriticalAt = -2;
-
-    // Criticality-rate governor: a one-sided CAP (never a target to hit
-    // exactly) on the fraction of fetch-time IsPredictedCritical()
-    // lookups that return true. Disabled by default -- when disabled,
-    // promoteCriticalAt above is used exactly as configured, as if this
-    // whole mechanism didn't exist.
-    //
-    // When enabled, promoteCriticalAt becomes a FLOOR rather than a
-    // fixed value: the engine tracks the observed critical rate over
-    // windows of criticalRateControlInterval lookups, and if a window's
-    // rate exceeds targetCriticalRate + criticalRateDeadband, the
-    // EFFECTIVE promotion threshold is nudged one step stricter
-    // (requiring more evidence before promoting). If a window's rate
-    // falls below targetCriticalRate - criticalRateDeadband, the
-    // effective threshold is nudged one step back toward -- but never
-    // past -- promoteCriticalAt itself. Being under the cap is always
-    // fine and never relaxes the threshold any softer than the host's
-    // own configured value; the governor only ever adds extra
-    // strictness on top of it, and only when the cap would otherwise be
-    // exceeded. promoteNonCriticalAt (demotion) is never touched by
-    // this mechanism.
-    //
-    // If the organic (un-governed) critical rate for a workload is
-    // already at or below the cap, the effective threshold simply
-    // settles back at promoteCriticalAt and this is a no-op in
-    // practice. If even the maximum possible strictness
-    // (trainCounterMax) isn't enough to bring a workload under the cap,
-    // the cap is approached as closely as a single threshold dimension
-    // allows, never exceeded by construction, but not fully hit either
-    // -- an honest limit, not a bug.
-    //
-    // IMPORTANT usage requirement, empirically confirmed (not just a
-    // theoretical caveat): this governor needs real headroom between
-    // promoteCriticalAt and trainCounterMax to work at all. Each
-    // tightening step can only move the effective threshold to the next
-    // integer value the training counter can actually reach, so with
-    // only 1-2 such steps available, the governor swings between
-    // "admit everyone" and "admit no one" and the ACHIEVED rate can
-    // overshoot the cap by 5-7x on realistic workloads, no matter how
-    // criticalRateRelaxDwellWindows is tuned. With >=5-6 steps of
-    // headroom, the same mechanism converges cleanly near the cap. This
-    // project's OWN baseline defaults (promoteCriticalAt=2,
-    // trainCounterMax=3) are exactly the bad case -- only one notch of
-    // headroom -- so raise trainCounterMax well above promoteCriticalAt
-    // specifically when enabling this governor; the defaults are tuned
-    // for hysteresis depth alone and were never validated against this
-    // mechanism.
-    bool enableCriticalRateGovernor = false;
-    double targetCriticalRate = 0.10;     // the cap, e.g. 0.10 == 10%
-    double criticalRateDeadband = 0.01;   // +/- band around the cap with no adjustment
-    // How many IsPredictedCritical() lookups make up one control
-    // decision. Must be >= 1 when enableCriticalRateGovernor is true --
-    // TokenEngine's constructor throws std::invalid_argument otherwise
-    // (it is used as a divisor).
-    std::uint32_t criticalRateControlInterval = 1024;
-
-    // Asymmetric response, deliberately: a single over-cap window
-    // tightens immediately (the cap must never be exceeded for long),
-    // but relaxing back toward the floor requires this many CONSECUTIVE
-    // under-cap windows first. Without this, a population that responds
-    // to the threshold in one hard step (many PCs crossing it at once,
-    // rather than a smooth spread) makes the governor oscillate: it
-    // tightens, the rate crashes, the very next window looks
-    // comfortably under cap and relaxes right back, re-admitting
-    // another burst -- a clean bang-bang limit cycle that averages out
-    // far above the cap despite every individual decision looking
-    // correct in isolation. Must be >= 1 when
-    // enableCriticalRateGovernor is true.
-    std::uint32_t criticalRateRelaxDwellWindows = 4;
-
-    // Debugging/visualization aid only -- never enable in anything
-    // performance-sensitive. When true, every table allocation,
-    // eviction, promotion, demotion, prediction lookup, and governor
-    // threshold change is printed to stdout, one line each, every line
-    // starting with the exact token "@@ISQCRIT@@" so a log consumer
-    // (see tools/visualize_trace.py) can pull these lines out
-    // unambiguously even when the host's own stdout logging is
-    // interleaved on the same stream. Disabled by default; zero cost
-    // when disabled beyond the branch itself.
-    bool enableTraceLog = false;
+    // Everything about HOW a sample gets turned into a prediction --
+    // table sizing, eviction policy, distance thresholds, the rate
+    // governor -- lives here, in the predictor's own config, completely
+    // independent of the token-sampling strategy above. See
+    // criticality_predictor.h. A host wanting "ideal mode" (no tokens,
+    // every dynamic instruction measured) constructs a bare
+    // CriticalityPredictor directly from this same struct instead of
+    // going through TokenEngine at all.
+    PredictorConfig predictor;
 };
-
-// The counter width/type lives in exactly one place. Change it here (e.g.
-// to a narrower type, or to something atomic if a host ever drives this
-// engine from more than one thread) and every counter follows.
-using StatCounter = std::uint64_t;
 
 // The counters themselves live in the HOST's own stats storage, not
 // inside this engine -- it never allocates or owns any counter memory of
@@ -237,9 +75,11 @@ using StatCounter = std::uint64_t;
 struct CriticalityStatPointers {
     StatCounter* tokensAssigned = nullptr;
     StatCounter* tokensExpired = nullptr;       // refcount reached zero, slot freed
-    StatCounter* trainingEvents = nullptr;      // a distance measurement was taken
-    StatCounter* criticalPromotions = nullptr;
-    StatCounter* nonCriticalPromotions = nullptr;
+
+    // Training/promotion counters -- forwarded straight through to the
+    // internal CriticalityPredictor's own SetupStats(). See
+    // PredictorStatPointers.
+    PredictorStatPointers predictor;
 };
 
 class TokenEngine {
@@ -249,6 +89,8 @@ public:
     // this engine cannot safely treat as zero (see their comments above),
     // and validating unconditionally is simpler and safer in a release
     // build than relying on assert(), which compiles away under NDEBUG.
+    // Also throws for any invalid field in cfg.predictor -- see
+    // CriticalityPredictor's own constructor.
     explicit TokenEngine(const CriticalityConfig& cfg = CriticalityConfig{});
     ~TokenEngine();
 
@@ -281,7 +123,8 @@ public:
     // Read-only prediction lookup, usable independently of whether this
     // particular dynamic instance was sampled by a token. Call in
     // parallel with your instruction-cache fetch; false (non-critical) is
-    // returned for any PC with no trained entry yet.
+    // returned for any PC with no trained entry yet. A pure pass-through
+    // to the internal CriticalityPredictor.
     bool IsPredictedCritical(Addr pc) const;
 
     // --- Execute, wakeup, and flush: no engine calls at all --------------
@@ -298,7 +141,9 @@ public:
     // entry point is needed.
 
     static std::int32_t PriorityBoost(bool predictedCritical,
-                                       std::int32_t boostMagnitude = 1);
+                                       std::int32_t boostMagnitude = 1) {
+        return CriticalityPredictor::PriorityBoost(predictedCritical, boostMagnitude);
+    }
 
     // Call once, typically right after construction, pointing each field
     // at counter storage the HOST already owns. See CriticalityStatPointers.

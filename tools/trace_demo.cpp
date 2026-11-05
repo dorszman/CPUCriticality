@@ -47,15 +47,15 @@ void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance) {
 int main() {
     CriticalityConfig cfg;
     cfg.tokenAssignInterval = 1;
-    cfg.criticalDistanceCycles = 2;
-    cfg.nonCriticalDistanceCycles = 8;
+    cfg.predictor.criticalDistanceCycles = 2;
+    cfg.predictor.nonCriticalDistanceCycles = 8;
 
     // Exactly 8 slots per table -- the whole table IS the 8 tracked
     // entries, guaranteeing every slot sees real activity.
-    cfg.trainingTableEntriesLog2 = 3;
-    cfg.trainingTableWays = 1;
-    cfg.predictionTableEntriesLog2 = 3;
-    cfg.predictionTableWays = 1;
+    cfg.predictor.trainingTableEntriesLog2 = 3;
+    cfg.predictor.trainingTableWays = 1;
+    cfg.predictor.predictionTableEntriesLog2 = 3;
+    cfg.predictor.predictionTableWays = 1;
 
     // Real headroom above the floor -- see DESIGN.md Sec 3.8: 1-2 steps
     // of headroom makes the governor overshoot badly regardless of
@@ -64,18 +64,18 @@ int main() {
     // needs to clear THAT, not just be "a few steps above the floor",
     // or the effective threshold hits its own ceiling before it's
     // actually strict enough to filter most PCs out.
-    cfg.promoteCriticalAt = 2;
-    cfg.promoteNonCriticalAt = -2;
-    cfg.trainCounterMin = -40;
-    cfg.trainCounterMax = 40;
+    cfg.predictor.promoteCriticalAt = 2;
+    cfg.predictor.promoteNonCriticalAt = -2;
+    cfg.predictor.trainCounterMin = -40;
+    cfg.predictor.trainCounterMax = 40;
 
-    cfg.enableCriticalRateGovernor = true;
-    cfg.targetCriticalRate = 0.10;
-    cfg.criticalRateDeadband = 0.02;
-    cfg.criticalRateControlInterval = 64;
-    cfg.criticalRateRelaxDwellWindows = 4;
+    cfg.predictor.enableCriticalRateGovernor = true;
+    cfg.predictor.targetCriticalRate = 0.10;
+    cfg.predictor.criticalRateDeadband = 0.02;
+    cfg.predictor.criticalRateControlInterval = 64;
+    cfg.predictor.criticalRateRelaxDwellWindows = 4;
 
-    cfg.enableTraceLog = true;
+    cfg.predictor.enableTraceLog = true;
 
     TokenEngine engine(cfg);
 
