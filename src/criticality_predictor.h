@@ -117,7 +117,7 @@ struct PredictorConfig {
 
     // Saturating range for the per-PC training counter.
     std::int32_t trainCounterMin = -10;
-    std::int32_t trainCounterMax = 10;
+    std::int32_t trainCounterMax = 40;
 
     // Training-counter thresholds at which a PC is (re-)promoted into the
     // prediction table as critical / non-critical.
@@ -126,9 +126,8 @@ struct PredictorConfig {
 
     // Criticality-rate governor: a one-sided CAP (never a target to hit
     // exactly) on the fraction of IsPredictedCritical() lookups that
-    // return true. Disabled by default -- when disabled,
-    // promoteCriticalAt above is used exactly as configured, as if this
-    // whole mechanism didn't exist.
+    // return true. On by default. Set this false to use promoteCriticalAt
+    // exactly as configured, as if this whole mechanism didn't exist.
     //
     // When enabled, promoteCriticalAt becomes a FLOOR rather than a
     // fixed value: the predictor tracks the observed critical rate over
@@ -165,13 +164,10 @@ struct PredictorConfig {
     // criticalRateRelaxDwellWindows is tuned. With >=5-6 steps of
     // headroom, the same mechanism converges cleanly near the cap. This
     // project's OWN baseline defaults (promoteCriticalAt=5,
-    // trainCounterMax=10) give exactly 5 steps of headroom -- right at
-    // the low edge of the validated-good range, not the bad case
-    // anymore, but still worth raising trainCounterMax further above
-    // promoteCriticalAt if your workload's own data shows the governor
-    // still overshooting; the defaults are tuned for hysteresis depth
-    // alone and were never validated end-to-end against this mechanism.
-    bool enableCriticalRateGovernor = false;
+    // trainCounterMax=40) give 35 steps of headroom, well above the
+    // 5-6 this governor wants. The defaults were tuned for hysteresis
+    // depth and were never validated end-to-end against this mechanism.
+    bool enableCriticalRateGovernor = true;
     double targetCriticalRate = 0.10;     // the cap, e.g. 0.10 == 10%
     double criticalRateDeadband = 0.01;   // +/- band around the cap with no adjustment
     // How many IsPredictedCritical() lookups make up one control
@@ -196,8 +192,9 @@ struct PredictorConfig {
 
     // Debugging/visualization aid only -- never enable in anything
     // performance-sensitive. When true, every table allocation,
-    // eviction, promotion, demotion, prediction lookup, and governor
-    // threshold change is printed to traceLogStream, one line each,
+    // eviction, promotion, demotion, prediction lookup, and the
+    // effective promotion threshold (its initial value, then each
+    // later change) is printed to traceLogStream, one line each,
     // every line starting with the exact token "@@ISQCRIT@@" so a log
     // consumer (see tools/visualize_trace.py) can pull these lines out
     // unambiguously even if something else writes to the same stream.

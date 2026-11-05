@@ -179,6 +179,7 @@ class DatasetBuilder:
         self.train_slots = {i: SlotData() for i in range(NUM_TRACK_SLOTS)}
         self.pred_slots = {i: SlotData() for i in range(NUM_TRACK_SLOTS)}
         self.effective_series = []       # global: [(x, y)]
+        self.demote_threshold_series = []  # global: positive magnitude
         self.critical_ratio_series = []  # global: [(x, y)]
         # Arbitrary host-reported stats (TokenEngine::TraceLogStat), e.g.
         # "ninst" -- name -> [(x, y)]. Generic on purpose: whatever name
@@ -209,6 +210,10 @@ class DatasetBuilder:
 
             if table == "train" and event == "effective_change":
                 self.effective_series.append((decode, ev["value"]))
+                continue
+
+            if table == "train" and event == "demote_threshold":
+                self.demote_threshold_series.append((decode, ev["value"]))
                 continue
 
             if table == "host" and event == "stat":
@@ -327,11 +332,34 @@ def show(log_thread, interval_seconds):
 
         draw_pc_markers(ax_train, sd.pc_changes)
 
-        xs, ys = _xy(sd.count_series)
-        ax_train.step(xs, ys, where="post", color="#1f77b4", label="count", linewidth=1.5)
-        xs, ys = _xy(dataset.effective_series)
-        ax_train.step(xs, ys, where="post", color="#888888", linestyle=":",
-                       label="effective promote threshold", linewidth=1.2)
+        xs, raw = _xy(sd.count_series)
+        # The counter itself runs negative to reach a demotion. Draw that
+        # depth upward so a demotion is a positive number on this axis.
+        count_y = [y if y > 0 else 0 for y in raw]
+        demote_y = [-y if y < 0 else 0 for y in raw]
+        ax_train.step(xs, count_y, where="post", color="#1f77b4", label="count", linewidth=1.5)
+        ax_train.step(xs, demote_y, where="post", color="#e67e22", label="demotion", linewidth=1.5)
+
+        end_x = xs[-1] if xs else 0
+        for series in (sd.count_series, sd.promote_cum, sd.demote_cum,
+                       dataset.effective_series, dataset.demote_threshold_series,
+                       dataset.host_stats.get("ninst", [])):
+            if series:
+                end_x = max(end_x, series[-1][0])
+
+        def stretch(series):
+            sx, sy = _xy(series)
+            if sx and end_x > sx[-1]:
+                sx = list(sx) + [end_x]
+                sy = list(sy) + [sy[-1]]
+            return sx, sy
+
+        xs, ys = stretch(dataset.effective_series)
+        ax_train.step(xs, ys, where="post", color="#444444", linestyle=":",
+                       label="effective promote threshold", linewidth=1.6)
+        xs, ys = stretch(dataset.demote_threshold_series)
+        ax_train.step(xs, ys, where="post", color="#e67e22", linestyle=":",
+                       label="demote threshold", linewidth=1.6)
 
         xs, ys = _xy(sd.promote_cum)
         ax_train_r.step(xs, ys, where="post", color="#2ca02c", label="cumulative promotes", linewidth=1.5)

@@ -291,6 +291,28 @@ struct CriticalityPredictor::Impl {
         // cfg.promoteCriticalAt and never updated when the governor is
         // disabled, so UpdateIssueqReadyWaitingTime() below can use this field unconditionally.
         promoteCriticalAtEffective = cfg.promoteCriticalAt;
+
+        // Logged once up front, including when the governor is off and
+        // this value never moves. Later changes are logged from
+        // UpdateRateGovernor(); without this initial line a constant
+        // threshold never appears in the trace at all.
+        if (cfg.enableTraceLog && cfg.traceLogStream) {
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
+                         kTraceLogPrefix, promoteCriticalAtEffective, 0.0,
+                         static_cast<unsigned long long>(lookupCounter));
+            // Same threshold the counter compares against, logged as a
+            // positive magnitude so a graph can draw it upward. The
+            // stored counter still goes negative; only the trace does not.
+            std::int32_t demoteAt = cfg.promoteNonCriticalAt < 0
+                                        ? -cfg.promoteNonCriticalAt
+                                        : cfg.promoteNonCriticalAt;
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=demote_threshold value=%d decode=%llu\n",
+                         kTraceLogPrefix, demoteAt,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
+        }
     }
 
     // --- Training / prediction tables -----------------------------------

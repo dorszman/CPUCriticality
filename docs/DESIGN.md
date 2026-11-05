@@ -380,10 +380,9 @@ can only move to the next integer the training counter can actually
 reach, so with only 1-2 such steps available the governor still
 overshoots the cap by 5-7x on realistic workloads no matter how dwell
 is tuned; with 5-6+ steps of headroom it converges cleanly near the
-cap. This project's own baseline defaults (`promoteCriticalAt=2`,
-`trainCounterMax=3`) are exactly the bad case — raise `trainCounterMax`
-well above `promoteCriticalAt` specifically when enabling this
-governor.
+cap. This project's own baseline defaults (`promoteCriticalAt=5`,
+`trainCounterMax=40`, governor on) give 35 steps of headroom, well
+above that range.
 
 ### 3.9 Two-layer architecture: sampling strategy vs. the predictor itself
 
@@ -575,10 +574,11 @@ mix:
   or `kDecayedPriorityThenLru`.
 - `enableCriticalRateGovernor` / `targetCriticalRate` /
   `criticalRateDeadband` / `criticalRateControlInterval` /
-  `criticalRateRelaxDwellWindows`: see §3.8. Disabled by default. If
-  enabled, make sure `trainCounterMax` has real headroom above
-  `promoteCriticalAt` (5-6+ steps, empirically) — see the warning in
-  §3.8; this project's own baseline defaults do not have enough.
+  `criticalRateRelaxDwellWindows`: see §3.8. On by default; set
+  `enableCriticalRateGovernor` false to use `promoteCriticalAt` as a
+  fixed threshold. The baseline defaults leave 35 steps between
+  `promoteCriticalAt` (5) and `trainCounterMax` (40) — see the warning
+  in §3.8.
 
 ---
 
