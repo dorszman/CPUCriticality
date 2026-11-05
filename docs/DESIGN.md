@@ -541,7 +541,31 @@ predictor copies it onto the trace and does not interpret it.
 Split across two structs per §3.9: `CriticalityConfig` (token-sampling
 knobs, plus a nested `predictor` field) and `PredictorConfig`
 (everything else below). Starting points to tune against your workload
-mix:
+mix.
+
+### 6.1 Live knobs
+
+These `PredictorConfig` fields may change while the model is running.
+The next sample or lookup uses the new value. Learned entries stay in
+the tables. Token-sampling fields are not in this set. `enableTraceLog`
+and `traceLogStream` are not in this set.
+
+- `enablePrediction`
+- `criticalDistanceCycles`, `nonCriticalDistanceCycles`
+- `promoteCriticalAt`, `promoteNonCriticalAt`
+- `trainCounterMin`, `trainCounterMax`
+- `enableCriticalRateGovernor`, `targetCriticalRate`, `criticalRateDeadband`, `criticalRateControlInterval`, `criticalRateRelaxDwellWindows`
+- `trainingTableEvictionPolicy`, `predictionTableEvictionPolicy`
+- `trainingTableDecayIdleUnit`, `predictionTableDecayIdleUnit`
+
+Fixed for the life of the process: table geometry
+(`trainingTableEntriesLog2`, `predictionTableEntriesLog2`,
+`trainingTableWays`, `predictionTableWays`), `tokenPoolSize`,
+`tokenAssignInterval`, `pureAvailabilityGating`, `enableTraceLog`, and
+`traceLogStream`. A different table size or token pool is a new
+predictor.
+
+Starting points for the knobs above:
 
 - `tokenPoolSize`: trade-off between statistical sample rate and area/power.
 - `tokenAssignInterval`: sparsity of sampling; smaller = more samples, more
