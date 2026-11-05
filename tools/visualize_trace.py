@@ -174,6 +174,9 @@ class LogTailThread(threading.Thread):
         # previous run.
         self.identity = None
         self.prefix = None
+        self._fast_lock = threading.Lock()
+        self.live_pending = []
+        self.control_path_fast = None
 
     def run(self):
         while not self._stop.is_set():
@@ -185,6 +188,29 @@ class LogTailThread(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+    def _note_fast(self, fields):
+        # Live config must show up when it is written, not after the
+        # chart has replayed every earlier training line.
+        table = fields.get("table")
+        if table == "live":
+            with self._fast_lock:
+                self.live_pending.append(fields)
+        elif table == "control" and fields.get("path"):
+            with self._fast_lock:
+                self.control_path_fast = fields["path"]
+
+    def take_live(self):
+        with self._fast_lock:
+            items = self.live_pending
+            self.live_pending = []
+            path = self.control_path_fast
+        return items, path
+
+    def clear_fast(self):
+        with self._fast_lock:
+            self.live_pending = []
+            self.control_path_fast = None
 
     def _discard_queued(self):
         while True:
@@ -216,6 +242,7 @@ class LogTailThread(threading.Thread):
                     self.prefix = head
                 if replaced:
                     self._discard_queued()
+                    self.clear_fast()
                     self.pos = 0
                     self.queue.put(RUN_RESET)
                     queued += 1
@@ -233,6 +260,7 @@ class LogTailThread(threading.Thread):
                         for line in complete.decode("utf-8", errors="replace").splitlines():
                             fields = parse_line(line)
                             if fields is not None:
+                                self._note_fast(fields)
                                 self.queue.put(fields)
                                 queued += 1
                     if len(chunk) < self.CHUNK_SIZE:
@@ -245,6 +273,7 @@ class LogTailThread(threading.Thread):
                 self.identity = None
                 self.prefix = None
                 self.pos = 0
+                self.clear_fast()
                 self._discard_queued()
                 self.queue.put(RUN_RESET)
                 return 1
@@ -303,7 +332,7 @@ class DatasetBuilder:
         self.pred_slots = {i: SlotData() for i in range(NUM_TRACK_SLOTS)}
         self.effective_series = []       # global: [(x, y)]
         self.demote_threshold_series = []  # global: signed level the counter crosses
-        self.critical_ratio_series = []  # global: [(x, y)] prediction lookups
+        self.critical_ratio_series = []  # governor window rate, one point when that window closes
         # Distance-class window (table=train event=distance_class).
         # Global, like the effective threshold: one point per completed
         # window, class count over the window total.
@@ -333,9 +362,7 @@ class DatasetBuilder:
         # that same table's own alloc events, processed in the same
         # chronological order as the log.
         self._pc_to_train_slot = {}
-
-        self._total_lookups = 0
-        self._total_critical = 0
+        self._live_seen = set()
 
     def reset(self):
         """Drop every series. The log file was removed or replaced."""
@@ -396,6 +423,9 @@ class DatasetBuilder:
                 continue
 
             if table == "live":
+                if decode in self._live_seen:
+                    continue
+                self._live_seen.add(decode)
                 snap = {}
                 complete = True
                 for name, kind in LIVE_FIELDS:
@@ -434,13 +464,10 @@ class DatasetBuilder:
                     sd.count_series.append((decode, ev["count"]))
 
             elif table == "pred":
+                if event == "criticality":
+                    self.critical_ratio_series.append((decode, ev["rate"]))
+                    continue
                 if event == "lookup":
-                    self._total_lookups += 1
-                    if ev.get("critical"):
-                        self._total_critical += 1
-                    self.critical_ratio_series.append(
-                        (decode, self._total_critical / self._total_lookups)
-                    )
                     slot = ev.get("slot")
                     if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                         sd = self.pred_slots[slot]
@@ -791,7 +818,37 @@ def show(log_thread, interval_seconds):
     made = {"ok": False}
     shown = {}
 
-    def push(line, key, slot, series, ymap=None, max_points=2500):
+    def _keep_peaks(dx, dy):
+        # Fold the line in place so it stays bounded, but keep the high
+        # and low sample of each group. A plain stride dropped those
+        # peaks, so the top of the line sank as the run grew.
+        out_x = []
+        out_y = []
+        i = 0
+        n = len(dx)
+        while i < n:
+            j = min(i + 4, n)
+            xs = dx[i:j]
+            ys = dy[i:j]
+            if len(ys) <= 2:
+                out_x.extend(xs)
+                out_y.extend(ys)
+            else:
+                low = min(range(len(ys)), key=ys.__getitem__)
+                high = max(range(len(ys)), key=ys.__getitem__)
+                for k in sorted({low, high}):
+                    out_x.append(xs[k])
+                    out_y.append(ys[k])
+            i = j
+        if out_x and out_x[0] != dx[0]:
+            out_x.insert(0, dx[0])
+            out_y.insert(0, dy[0])
+        if out_x and out_x[-1] != dx[-1]:
+            out_x.append(dx[-1])
+            out_y.append(dy[-1])
+        return out_x, out_y
+
+    def push(line, key, slot, series, ymap=None):
         st = shown.get(key)
         if st is None or st[0] != slot:
             dx, dy, n, ymin, ymax = [], [], 0, 0.0, 0.0
@@ -812,16 +869,11 @@ def show(log_thread, interval_seconds):
                 if y > ymax:
                     ymax = y
             n = len(series)
-            if len(dx) > max_points:
-                step = max(1, len(dx) // max_points)
-                dx = dx[::step]
-                dy = dy[::step]
-                x, y = series[-1]
-                if ymap is not None:
-                    y = ymap(y)
-                if not dx or dx[-1] != x:
-                    dx.append(x)
-                    dy.append(y)
+            while len(dx) > 4000:
+                before = len(dx)
+                dx, dy = _keep_peaks(dx, dy)
+                if len(dx) >= before:
+                    break
         if changed:
             line.set_data(dx, dy)
         shown[key] = (slot, n, dx, dy, ymin, ymax)
@@ -1131,20 +1183,29 @@ def show(log_thread, interval_seconds):
         if not plt.fignum_exists(fig.number):
             return
         poll_live()
-        # A slow run writes about two thousand lines a second. One frame
-        # takes enough to keep up, and leaves any surplus for the next
-        # paint, so the trace moves instead of jumping.
-        new_events = log_thread.drain_some(4000)
+        # Live config is taken from the reader before the backlog. A
+        # change is drawn on this frame, not after every older line.
+        lives, path = log_thread.take_live()
+        if path and not dataset.control_path:
+            dataset.control_path = path
+        new_events = log_thread.drain_some(8000)
+        if new_events and RUN_RESET in new_events:
+            last = max(i for i, ev in enumerate(new_events) if ev is RUN_RESET)
+            clear_charts()
+            log_thread.clear_fast()
+            new_events = new_events[last + 1:]
+            lives, path = log_thread.take_live()
+            if path:
+                dataset.control_path = path
+        if lives:
+            dataset.feed(lives)
         if new_events:
-            if RUN_RESET in new_events:
-                last = max(i for i, ev in enumerate(new_events) if ev is RUN_RESET)
-                clear_charts()
-                new_events = new_events[last + 1:]
+            dataset.feed(new_events)
+        if lives or new_events:
             if new_events:
-                dataset.feed(new_events)
-            draw_train(ui["train_slot"], preserve_view=False)
-            draw_class()
-            draw_pred(ui["pred_slot"], preserve_view=False)
+                draw_train(ui["train_slot"], preserve_view=False)
+                draw_class()
+                draw_pred(ui["pred_slot"], preserve_view=False)
             draw_knobs()
             paint()
         window = getattr(getattr(fig.canvas, "manager", None), "window", None)

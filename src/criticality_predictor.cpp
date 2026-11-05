@@ -626,11 +626,19 @@ struct CriticalityPredictor::Impl {
         } else {
             rateGoodWindowStreak = 0; // in the deadband: neutral, not "good"
         }
-        if (cfg.enableTraceLog && promoteCriticalAtEffective != before) {
+        if (cfg.enableTraceLog && cfg.traceLogStream) {
+            // Same window the governor just closed. The chart plots this
+            // rate and does not keep a second counter of its own.
             std::fprintf(cfg.traceLogStream,
-                         "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
-                         kTraceLogPrefix, promoteCriticalAtEffective, rate,
+                         "%s table=pred event=criticality rate=%.6f decode=%llu\n",
+                         kTraceLogPrefix, rate,
                          static_cast<unsigned long long>(lookupCounter));
+            if (promoteCriticalAtEffective != before) {
+                std::fprintf(cfg.traceLogStream,
+                             "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
+                             kTraceLogPrefix, promoteCriticalAtEffective, rate,
+                             static_cast<unsigned long long>(lookupCounter));
+            }
             std::fflush(cfg.traceLogStream);
         }
         rateWindowHits = 0;

@@ -672,7 +672,7 @@ the host calls `TraceLogHostStats`.
 | Criticality table | Critical/Total | Share of waits at or below `criticalDistanceCycles` |
 | Criticality table | Normal/Total | Share of waits strictly between the two distance thresholds |
 | Criticality table | NonCritical/Total | Share of waits at or above `nonCriticalDistanceCycles` |
-| Criticality table | Criticality | Fraction of all lookups predicted critical |
+| Criticality table | Criticality | Fraction of lookups predicted critical in the governor's window, logged when that window closes |
 | Prediction, selected slot | cumulative critical count / cumulative non-critical count | Running totals of predicted-critical and predicted-non-critical samples |
 | Prediction, selected slot | cumulative hit count | Hit count that keeps climbing across new allocations |
 | Prediction, selected slot | ninst | Same host retired-instruction count |
