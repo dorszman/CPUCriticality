@@ -39,14 +39,23 @@ constexpr const char* kTraceLogPrefix = "@@ISQCRIT@@";
 // simply free (no real eviction), never 0, since 0 can be a real PC
 // (see kNoEvictionTag's own comment) and a log consumer has no other
 // way to tell the two apart.
-void TraceLogAcquire(bool enabled, const char* table, std::size_t index, bool wasHit,
+void TraceLogAcquire(std::FILE* stream, const char* table, std::size_t index, bool wasHit,
                       Addr evictedTag, Addr newPc, std::uint64_t decode) {
-    if (!enabled || wasHit) return;
-    std::printf("%s table=%s slot=%zu event=alloc old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
-                kTraceLogPrefix, table, index,
-                static_cast<unsigned long long>(evictedTag),
-                static_cast<unsigned long long>(newPc),
-                static_cast<unsigned long long>(decode));
+    if (!stream || wasHit) return;
+    std::fprintf(stream, "%s table=%s slot=%zu event=alloc old_pc=0x%llx new_pc=0x%llx decode=%llu\n",
+                 kTraceLogPrefix, table, index,
+                 static_cast<unsigned long long>(evictedTag),
+                 static_cast<unsigned long long>(newPc),
+                 static_cast<unsigned long long>(decode));
+    // Flush just this one line, on the caller-supplied stream --
+    // deliberately NOT a global stdout buffering-mode change (e.g.
+    // setvbuf), which would affect every OTHER line the host prints to
+    // the SAME stream for unrelated reasons too, forcing an extra flush
+    // syscall on all of it regardless of whether anyone's live-tailing
+    // those lines. Writing to a host-supplied, trace-dedicated stream
+    // (see PredictorConfig::traceLogStream) avoids this entirely when
+    // the host points it somewhere other than its own stdout.
+    std::fflush(stream);
 }
 
 // A PC-indexed, set-associative table shared by the training and
@@ -367,8 +376,8 @@ struct CriticalityPredictor::Impl {
     void UpdateIssueqReadyWaitingTime(Addr producerPc, std::int64_t waitingTime) {
         auto acq = trainTable.Acquire(producerPc);
         TrainEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog, "train", acq.index, acq.wasHit,
-                        acq.evictedTag, producerPc, lookupCounter);
+        TraceLogAcquire(cfg.enableTraceLog ? cfg.traceLogStream : nullptr, "train", acq.index,
+                        acq.wasHit, acq.evictedTag, producerPc, lookupCounter);
 
         if (waitingTime <= cfg.criticalDistanceCycles) {
             e.count = ClampAdd(e.count, +1, cfg.trainCounterMin, cfg.trainCounterMax);
@@ -379,9 +388,11 @@ struct CriticalityPredictor::Impl {
         }
         IncrementIfSet(statPtrs.trainingEvents);
         if (cfg.enableTraceLog) {
-            std::printf("%s table=train slot=%zu event=update pc=0x%llx count=%d decode=%llu\n",
-                        kTraceLogPrefix, acq.index, static_cast<unsigned long long>(producerPc), e.count,
-                        static_cast<unsigned long long>(lookupCounter));
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train slot=%zu event=update pc=0x%llx count=%d decode=%llu\n",
+                         kTraceLogPrefix, acq.index, static_cast<unsigned long long>(producerPc), e.count,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
         }
 
         // promoteCriticalAtEffective == cfg.promoteCriticalAt whenever
@@ -398,16 +409,18 @@ struct CriticalityPredictor::Impl {
     void Promote(Addr pc, bool critical) {
         auto acq = predTable.Acquire(pc); // valid/tag already correct either way
         PredEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog, "pred", acq.index, acq.wasHit,
-                        acq.evictedTag, pc, lookupCounter);
+        TraceLogAcquire(cfg.enableTraceLog ? cfg.traceLogStream : nullptr, "pred", acq.index,
+                        acq.wasHit, acq.evictedTag, pc, lookupCounter);
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
         else IncrementIfSet(statPtrs.nonCriticalPromotions);
         if (cfg.enableTraceLog) {
-            std::printf("%s table=pred slot=%zu event=%s pc=0x%llx hitCount=%u decode=%llu\n",
-                        kTraceLogPrefix, acq.index, critical ? "promote" : "demote",
-                        static_cast<unsigned long long>(pc), e.hitCount,
-                        static_cast<unsigned long long>(lookupCounter));
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=pred slot=%zu event=%s pc=0x%llx hitCount=%u decode=%llu\n",
+                         kTraceLogPrefix, acq.index, critical ? "promote" : "demote",
+                         static_cast<unsigned long long>(pc), e.hitCount,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
         }
     }
 
@@ -424,12 +437,14 @@ struct CriticalityPredictor::Impl {
             UpdateRateGovernor(critical);
         }
         if (cfg.enableTraceLog) {
-            std::printf("%s table=pred slot=%lld event=lookup pc=0x%llx critical=%d hitCount=%u decode=%llu\n",
-                        kTraceLogPrefix,
-                        found.entry ? static_cast<long long>(found.index) : -1LL,
-                        static_cast<unsigned long long>(pc), critical ? 1 : 0,
-                        found.entry ? found.entry->hitCount : 0u,
-                        static_cast<unsigned long long>(lookupCounter));
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=pred slot=%lld event=lookup pc=0x%llx critical=%d hitCount=%u decode=%llu\n",
+                         kTraceLogPrefix,
+                         found.entry ? static_cast<long long>(found.index) : -1LL,
+                         static_cast<unsigned long long>(pc), critical ? 1 : 0,
+                         found.entry ? found.entry->hitCount : 0u,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
         }
         // Only the RETURNED value is masked -- see
         // PredictorConfig::enablePrediction.
@@ -474,12 +489,23 @@ struct CriticalityPredictor::Impl {
             rateGoodWindowStreak = 0; // in the deadband: neutral, not "good"
         }
         if (cfg.enableTraceLog && promoteCriticalAtEffective != before) {
-            std::printf("%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
-                        kTraceLogPrefix, promoteCriticalAtEffective, rate,
-                        static_cast<unsigned long long>(lookupCounter));
+            std::fprintf(cfg.traceLogStream,
+                         "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
+                         kTraceLogPrefix, promoteCriticalAtEffective, rate,
+                         static_cast<unsigned long long>(lookupCounter));
+            std::fflush(cfg.traceLogStream);
         }
         rateWindowHits = 0;
         rateWindowTotal = 0;
+    }
+
+    void TraceLogStat(const char* name, std::int64_t value) const {
+        if (!cfg.enableTraceLog) return;
+        std::fprintf(cfg.traceLogStream,
+                     "%s table=host event=stat name=%s value=%lld decode=%llu\n",
+                     kTraceLogPrefix, name, static_cast<long long>(value),
+                     static_cast<unsigned long long>(lookupCounter));
+        std::fflush(cfg.traceLogStream);
     }
 };
 
@@ -498,6 +524,10 @@ bool CriticalityPredictor::IsPredictedCritical(Addr pc) const {
 
 void CriticalityPredictor::SetupStats(const PredictorStatPointers& counters) {
     impl_->statPtrs = counters;
+}
+
+void CriticalityPredictor::TraceLogStat(const char* name, std::int64_t value) {
+    impl_->TraceLogStat(name, value);
 }
 
 } // namespace ISQCrit

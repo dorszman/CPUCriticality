@@ -146,6 +146,16 @@ public:
     // call at all (every counter is then simply never incremented).
     void SetupStats(const CriticalityStatPointers& counters);
 
+    // Debugging/visualization aid only, same spirit as
+    // cfg.predictor.enableTraceLog -- a no-op unless it's enabled. Lets
+    // the host log an arbitrary named stat it tracks itself (retired
+    // instruction count, IPC, whatever) through the SAME trace stream,
+    // tagged so it lines up on the same X axis as every other trace
+    // line (see tools/visualize_trace.py). A pure pass-through to the
+    // internal CriticalityPredictor -- this engine has no notion of
+    // "retirement" or any other host-side concept itself.
+    void TraceLogStat(const char* name, std::int64_t value);
+
 private:
     friend class Token;
     // API called by the token itself (Token::DoNotifyExecuted forwards

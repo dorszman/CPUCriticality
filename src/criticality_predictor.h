@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace ISQCrit {
 
@@ -195,13 +196,27 @@ struct PredictorConfig {
     // Debugging/visualization aid only -- never enable in anything
     // performance-sensitive. When true, every table allocation,
     // eviction, promotion, demotion, prediction lookup, and governor
-    // threshold change is printed to stdout, one line each, every line
-    // starting with the exact token "@@ISQCRIT@@" so a log consumer
-    // (see tools/visualize_trace.py) can pull these lines out
-    // unambiguously even when the host's own stdout logging is
-    // interleaved on the same stream. Disabled by default; zero cost
-    // when disabled beyond the branch itself.
+    // threshold change is printed to traceLogStream, one line each,
+    // every line starting with the exact token "@@ISQCRIT@@" so a log
+    // consumer (see tools/visualize_trace.py) can pull these lines out
+    // unambiguously even if something else writes to the same stream.
+    // Disabled by default; zero cost when disabled beyond the branch
+    // itself.
     bool enableTraceLog = false;
+
+    // Where enableTraceLog's lines go. Defaults to stdout, but a host
+    // that itself prints a lot of unrelated volume to stdout should
+    // point this at a dedicated FILE* instead (e.g. fopen() a separate
+    // trace file and hand it in here) -- this predictor never opens,
+    // closes, or otherwise owns this stream; exactly like
+    // PredictorStatPointers, the host owns the resource and this
+    // predictor only ever writes through it. Each line is fflush()'d
+    // individually (never a stream-wide buffering-mode change, which
+    // would affect everything else written to the same stream too) so
+    // a live consumer tailing it sees lines promptly; this flush cost
+    // is scoped to exactly this stream and only while enableTraceLog
+    // is on.
+    std::FILE* traceLogStream = stdout;
 };
 
 // The counter width/type lives in exactly one place. Change it here (e.g.
@@ -258,6 +273,18 @@ public:
     // Safe to call with any subset of fields left null; safe to never
     // call at all (every counter is then simply never incremented).
     void SetupStats(const PredictorStatPointers& counters);
+
+    // Debugging/visualization aid only, same spirit as enableTraceLog --
+    // a no-op unless it's enabled. Lets the host log an arbitrary named
+    // stat it tracks itself (retired instruction count, IPC, whatever)
+    // through the SAME trace stream, tagged with this predictor's own
+    // internal call counter so it lines up on the same X axis as every
+    // other trace line (see tools/visualize_trace.py). This predictor
+    // has no notion of "retirement" or any other host-side concept
+    // itself -- it never computes or interprets 'value', only logs it.
+    // Safe to call at any rate the host finds convenient; each call is
+    // one trace line.
+    void TraceLogStat(const char* name, std::int64_t value);
 
 private:
     struct Impl;

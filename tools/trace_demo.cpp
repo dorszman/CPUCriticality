@@ -15,9 +15,20 @@
 // tracked slot's lifetime shows alloc -> promote -> demote -> alloc (by
 // the next generation, evicting this one).
 //
-// Build: g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/token.cpp -o trace_demo
-// Run:   ./trace_demo > /tmp/trace.log
-//        python3 tools/visualize_trace.py /tmp/trace.log trace.html
+// Build: g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/criticality_predictor.cpp src/token.cpp -o trace_demo
+//
+// Run, trace lines on the demo's own stdout (fine here since this demo
+// prints nothing else; a real host that dumps its own unrelated volume
+// to stdout should use the second form instead):
+//   ./trace_demo > /tmp/trace.log
+//
+// Run with trace lines going to their own dedicated file instead (see
+// PredictorConfig::traceLogStream) -- this demo's stdout stays free for
+// whatever else a real host would print there, and the log consumer
+// only ever reads the dedicated file, never a shared stream:
+//   ./trace_demo /tmp/trace.log
+//
+// Either way: python3 tools/visualize_trace.py /tmp/trace.log
 
 #include "token_engine.h"
 
@@ -28,7 +39,13 @@ using namespace ISQCrit;
 
 namespace {
 
-void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance) {
+// ninst: a stand-in for whatever retirement counter a real host already
+// tracks -- this engine has no notion of retirement itself (see
+// TokenEngine::TraceLogStat), so the demo just advances a plausible
+// count itself. Advances by more than 1 per edge to roughly stand in
+// for the many retired instructions around each measured producer-
+// consumer edge that this synthetic workload doesn't otherwise model.
+void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance, std::uint64_t& ninst) {
     TokenRef producer = engine.DecodeGetToken(pc);
     engine.Tick(t);
     producer.NotifyExecuted(); // roots
@@ -40,11 +57,16 @@ void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance) {
     consumer.Reset();
     ++t;
     engine.IsPredictedCritical(pc); // fetch-time lookup, interleaved
+
+    ninst += 3;
+    engine.TraceLogStat("ninst", static_cast<std::int64_t>(ninst));
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::FILE* traceFile = nullptr; // only used/closed if a path was given
+
     CriticalityConfig cfg;
     cfg.tokenAssignInterval = 1;
     cfg.predictor.criticalDistanceCycles = 2;
@@ -76,6 +98,18 @@ int main() {
     cfg.predictor.criticalRateRelaxDwellWindows = 4;
 
     cfg.predictor.enableTraceLog = true;
+    if (argc > 1) {
+        // Dedicated trace file, opened and owned by this host (the demo
+        // standing in for a real CA model) -- the predictor only ever
+        // writes through cfg.predictor.traceLogStream, never opens or
+        // closes it.
+        traceFile = std::fopen(argv[1], "w");
+        if (!traceFile) {
+            std::fprintf(stderr, "could not open '%s' for trace output\n", argv[1]);
+            return 1;
+        }
+        cfg.predictor.traceLogStream = traceFile;
+    }
 
     TokenEngine engine(cfg);
 
@@ -84,6 +118,7 @@ int main() {
 
     const int kGenerations = 40;
     Cycle t = 0;
+    std::uint64_t ninst = 0;
     for (int gen = 0; gen < kGenerations; ++gen) {
         for (int slot = 0; slot < 8; ++slot) {
             // 4-byte-aligned PC whose low (log2(8)=3) set-index bits
@@ -95,10 +130,11 @@ int main() {
             int criticalReps = reps / 2;
             for (int r = 0; r < reps; ++r) {
                 std::int64_t distance = (r < criticalReps) ? 1 : 12;
-                DoEdge(engine, pc, t, distance);
+                DoEdge(engine, pc, t, distance, ninst);
             }
         }
     }
 
+    if (traceFile) std::fclose(traceFile);
     return 0;
 }
