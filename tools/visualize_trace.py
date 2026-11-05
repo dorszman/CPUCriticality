@@ -302,8 +302,9 @@ class SlotData:
     def __init__(self):
         # value series: list of (x, y) pairs
         self.count_series = []       # training table only
-        # Prediction table: running tallies of samples whose critical bit
-        # was 1 or 0. Both only increase. Replaces the old 0/1 step.
+        # Prediction table: running tallies of lookups whose critical bit
+        # was 1 or 0. A promote or demote is a different action and does
+        # not add to these. Both only increase.
         self.critical_count_series = []
         self.noncritical_count_series = []
         # Prediction table: hitCount accumulated so a new allocation
@@ -366,16 +367,18 @@ class DatasetBuilder:
         """Drop every series. The log file is read from the start."""
         self.__init__()
 
-    def _note_pred_sample(self, sd, decode, critical, hit_count):
-        """One prediction-table sample for this slot. Counts step by one
-        and never fall. A rising hitCount adds only the increase; a drop
-        (new allocation) adds the new logged value on top of the total."""
+    def _note_lookup(self, sd, decode, critical):
+        """One lookup for this slot. Promote and demote do not count."""
         if critical:
             sd._critical_count += 1
         else:
             sd._noncritical_count += 1
         sd.critical_count_series.append((decode, sd._critical_count))
         sd.noncritical_count_series.append((decode, sd._noncritical_count))
+
+    def _note_hit_count(self, sd, decode, hit_count):
+        """A rising hitCount adds only the increase. A drop, from a new
+        allocation, adds the new logged value on top of the total."""
         if hit_count >= sd._hit_last:
             sd._hit_acc += hit_count - sd._hit_last
         else:
@@ -469,7 +472,8 @@ class DatasetBuilder:
                     slot = ev.get("slot")
                     if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                         sd = self.pred_slots[slot]
-                        self._note_pred_sample(sd, decode, ev["critical"], ev["hitCount"])
+                        self._note_lookup(sd, decode, ev["critical"])
+                        self._note_hit_count(sd, decode, ev["hitCount"])
                     continue
 
                 if event == "alloc":
@@ -482,8 +486,7 @@ class DatasetBuilder:
                     slot = ev.get("slot")
                     if slot is not None and 0 <= slot < NUM_TRACK_SLOTS:
                         sd = self.pred_slots[slot]
-                        self._note_pred_sample(
-                            sd, decode, 1 if event == "promote" else 0, ev["hitCount"])
+                        self._note_hit_count(sd, decode, ev["hitCount"])
 
                     train_slot = self._pc_to_train_slot.get(ev["pc"])
                     if train_slot is not None:
