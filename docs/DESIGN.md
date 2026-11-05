@@ -556,7 +556,7 @@ mix.
 These `PredictorConfig` fields may change while the model is running.
 The next sample or lookup uses the new value. Learned entries stay in
 the tables. Token-sampling fields are not in this set. `enableTraceLog`
-and `traceLogStream` are not in this set.
+and `traceLogPath` are not in this set.
 
 - `enablePrediction`
 - `criticalDistanceCycles`, `nonCriticalDistanceCycles`
@@ -570,11 +570,9 @@ Fixed for the life of the process: table geometry
 (`trainingTableEntriesLog2`, `predictionTableEntriesLog2`,
 `trainingTableWays`, `predictionTableWays`), `tokenPoolSize`,
 `tokenAssignInterval`, `pureAvailabilityGating`, `enableTraceLog`,
-`traceLogStream`, `traceLogPath`, and `distanceClassInterval`. When
-tracing is on, the predictor clears the log before the first line. A `traceLogPath` is
-removed and created empty, so the new run is a new file. If the path is null, a regular file already
-open as `traceLogStream` (stdout redirected or appended onto the log)
-is truncated, and append mode is turned off. A terminal is left alone. A different table
+`traceLogPath`, and `distanceClassInterval`. When tracing is on and
+`traceLogPath` is set, `CriticalityPredictor` creates that one log file
+and keeps the open file private. A different table
 size or token pool is a new predictor.
 
 ### 6.2 Live control channel
@@ -593,7 +591,7 @@ every applied update, on the same lookup-count x-axis:
 @@ISQCRIT@@ table=live enablePrediction=1 criticalDistanceCycles=2 ... decode=N
 ```
 
-The field names are the `PredictorLiveConfig` fields. The viewer reads
+The field names are the live knobs in §6.1. The viewer reads
 `path`, connects, and sends one line containing every live field
 whenever a control changes. The reply is `queued` or `rejected`. A
 rejected line leaves the running knobs unchanged. A queued line is

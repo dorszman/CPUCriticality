@@ -17,15 +17,9 @@
 //
 // Build: g++ -std=c++17 -Isrc tools/trace_demo.cpp src/token_engine.cpp src/criticality_predictor.cpp src/token.cpp -o trace_demo
 //
-// Run, trace lines on the demo's own stdout (fine here since this demo
-// prints nothing else):
-//   ./trace_demo
-//
-// Run with the predictor opening a dedicated file. It truncates that
-// file itself, so a new run does not keep the previous one:
+// Run with CriticalityPredictor creating its log file:
 //   ./trace_demo /tmp/trace.log
-//
-// Either way: python3 tools/visualize_trace.py /tmp/trace.log
+//   python3 tools/visualize_trace.py /tmp/trace.log
 
 #include "token_engine.h"
 
@@ -95,7 +89,7 @@ int main(int argc, char** argv) {
 
     cfg.predictor.enableTraceLog = true;
     if (argc > 1) {
-        // The predictor opens this path with truncation when it starts.
+        // CriticalityPredictor creates this log file.
         cfg.predictor.traceLogPath = argv[1];
     }
 

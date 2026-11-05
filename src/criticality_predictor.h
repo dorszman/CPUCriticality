@@ -15,7 +15,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 
 namespace ISQCrit {
 
@@ -124,8 +123,8 @@ struct PredictorConfig {
     // counter). Normal is counted, not skipped. When the window fills,
     // tracing logs Critical/Total, NonCritical/Total, and
     // Normal/Total (they sum to 1) and the next window starts. Total
-    // is the sum of the three counts. Not a live knob and not part of
-    // PredictorLiveConfig. Must be >= 1 -- the constructor throws
+    // is the sum of the three counts. Not a live knob. Must be >= 1 --
+    // the constructor throws
     // std::invalid_argument if it is 0.
     std::uint32_t distanceClassInterval = 1024;
 
@@ -205,39 +204,23 @@ struct PredictorConfig {
     std::uint32_t criticalRateRelaxDwellWindows = 4;
 
     // Debugging/visualization aid only -- never enable in anything
-    // performance-sensitive. When true, every table allocation,
-    // eviction, promotion, demotion, prediction lookup, and the
-    // effective promotion threshold (its initial value, then each
-    // later change) is printed to traceLogStream, one line each,
-    // every line starting with the exact token "@@ISQCRIT@@" so a log
-    // consumer (see tools/visualize_trace.py) can pull these lines out
-    // unambiguously even if something else writes to the same stream.
-    // Disabled by default; zero cost when disabled beyond the branch
-    // itself. When enabled, the predictor also listens for live-knob
-    // updates (see PredictorLiveConfig) and writes the socket path into
-    // this same stream. The switch and the stream stay fixed for the
-    // life of the predictor.
+    // performance-sensitive. When true and traceLogPath is set, every
+    // table allocation, eviction, promotion, demotion, prediction
+    // lookup, and the effective promotion threshold (its initial value,
+    // then each later change) is printed to the log file the predictor
+    // creates, one line each, every line starting with the exact token
+    // "@@ISQCRIT@@" so a log consumer (see tools/visualize_trace.py)
+    // can pull these lines out. Disabled by default; zero cost when
+    // disabled beyond the branch itself. When enabled with a path, the
+    // predictor also listens for live-knob updates and writes the socket
+    // path into that same
+    // file. The switch and the path stay fixed for the life of the
+    // predictor.
     bool enableTraceLog = false;
 
-    // Where enableTraceLog's lines go when traceLogPath is null. Defaults
-    // to stdout. The predictor does not own this stream: it only writes
-    // through it. If that stream is a regular file, including stdout
-    // redirected or appended onto a log, the predictor truncates it at
-    // startup so the new run replaces the previous one. A terminal is
-    // not truncated. Each line is fflush()'d individually (never a
-    // stream-wide buffering-mode change, which would affect everything
-    // else written to the same stream too) so a live consumer tailing it
-    // sees lines promptly; this flush cost is scoped to exactly this
-    // stream and only while enableTraceLog is on.
-    std::FILE* traceLogStream = stdout;
-
-    // File the predictor itself opens when enableTraceLog is on. The
-    // previous file is removed first, then a new empty file is created,
-    // so a new run does not keep the previous run and a reader is not
-    // left at the old end of the same inode. The predictor owns that
-    // stream and closes it on destruction; traceLogStream is then the
-    // file it opened. Null leaves traceLogStream as the host supplied
-    // it, and a regular file there is truncated (append mode included).
+    // The one trace log. When enableTraceLog is on and this path is
+    // set, CriticalityPredictor creates that file, writes every trace
+    // line there, and closes it on destruction. Null means no log file.
     const char* traceLogPath = nullptr;
 };
 
@@ -265,28 +248,6 @@ struct PredictorStatPointers {
 // x-axis with the training and prediction lines.
 struct HostTraceStats {
     std::int64_t ninst = 0; // retired instructions
-};
-
-// One snapshot of the knobs that may change while the model is running
-// (docs/DESIGN.md §6.1). Every field is part of the update. An illegal
-// combination is refused and the knobs already in effect stay.
-struct PredictorLiveConfig {
-    bool enablePrediction = true;
-    std::int32_t criticalDistanceCycles = 2;
-    std::int32_t nonCriticalDistanceCycles = 8;
-    std::int32_t promoteCriticalAt = 5;
-    std::int32_t promoteNonCriticalAt = -3;
-    std::int32_t trainCounterMin = -10;
-    std::int32_t trainCounterMax = 40;
-    bool enableCriticalRateGovernor = true;
-    double targetCriticalRate = 0.10;
-    double criticalRateDeadband = 0.01;
-    std::uint32_t criticalRateControlInterval = 1024;
-    std::uint32_t criticalRateRelaxDwellWindows = 4;
-    EvictionPolicy trainingTableEvictionPolicy = EvictionPolicy::kLru;
-    EvictionPolicy predictionTableEvictionPolicy = EvictionPolicy::kDecayedPriorityThenLru;
-    std::uint64_t trainingTableDecayIdleUnit = 128;
-    std::uint64_t predictionTableDecayIdleUnit = 128;
 };
 
 class CriticalityPredictor {
@@ -334,20 +295,6 @@ public:
     // predictor never interprets the fields. Safe to call at any rate
     // the host finds convenient.
     void TraceLogHostStats(const HostTraceStats& stats);
-
-    // Apply one live update on the simulation thread. Returns false
-    // when the combination is illegal (counter min above max, critical
-    // distance above non-critical distance, a decay unit of 0, a
-    // governor interval or dwell of 0 while the governor is on, or a
-    // rate outside 0..1); the running knobs stay as they were.
-    // Learned table entries are left in place.
-    //
-    // With enableTraceLog, a viewer can send the same struct over the
-    // Unix socket named in the trace (`table=control path=...`). That
-    // update is applied at the start of the next train or lookup, and
-    // the values then in effect are written back as `table=live` with
-    // these field names.
-    bool ApplyLiveConfig(const PredictorLiveConfig& live);
 
 private:
     struct Impl;

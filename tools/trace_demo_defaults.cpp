@@ -11,8 +11,8 @@
 //
 // The default pace is one instruction per millisecond, so a live
 // viewer advances in small steps. --fast removes that pause.
-// This program does not open or delete the log. It only passes the
-// path; the predictor removes the previous file and creates a new one.
+// This program does not open the log. It only passes the path.
+// CriticalityPredictor creates that file.
 //   ./trace_demo_defaults /tmp/trace_live.log
 //   python3 tools/visualize_trace.py /tmp/trace_live.log
 
@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
     CriticalityConfig cfg;
     cfg.tokenAssignInterval = 1; // token-sampling knob, not a PredictorConfig default
     cfg.predictor.enableTraceLog = true; // only override: need output at all
-    // Path only. The predictor deletes the previous file and opens a new one.
+    // Path only. CriticalityPredictor creates the log file.
     if (logPath != nullptr) cfg.predictor.traceLogPath = logPath;
 
     TokenEngine engine(cfg);

@@ -23,8 +23,8 @@ Zoom and pan hold until Home, which snaps back to twice the samples
 seen at that moment and follows the stream again.
 Switching slots points the same lines at that slot's series.
 For this to actually show anything
-live, each trace line is fflush()'d individually by the writer (see
-PredictorConfig::traceLogStream in src/criticality_predictor.h) --
+live, each trace line is fflush()'d individually by the predictor
+on the log file it creates --
 otherwise the OS wouldn't see new bytes until the writer's internal
 buffer fills or it exits.
 
@@ -54,8 +54,8 @@ import threading
 import time
 
 TRACE_PREFIX = "@@ISQCRIT@@"
-# Queued when the log file is removed or replaced. The charts drop the
-# previous run and read the new file from the start.
+# Queued when the log file is gone or shorter. The charts drop what
+# they have drawn and read the file from the start.
 RUN_RESET = object()
 FIELD_RE = re.compile(r"(\w+)=(\S+)")
 HEX_FIELDS = {"pc", "new_pc", "old_pc"}
@@ -87,7 +87,7 @@ LIVE_FIELDS = [
     ("predictionTableDecayIdleUnit", "int"),
 ]
 POLICIES = ("kLru", "kDecayedHitCount", "kDecayedPriorityThenLru")
-# Editor starting values. Same numbers as PredictorLiveConfig. The
+# Editor starting values. Same numbers as the predictor's live knobs. The
 # panel always opens here; it does not copy the last snapshot out of
 # the log.
 LIVE_DEFAULTS = {
@@ -168,10 +168,9 @@ class LogTailThread(threading.Thread):
         self.queue = queue.Queue()
         self.pos = 0
         self._stop = threading.Event()
-        # inode of the file we are following, and its opening bytes. A
-        # new run removes that file and creates another, or truncates
-        # it; either one means the bytes already queued belong to the
-        # previous run.
+        # inode of the log file, and its opening bytes. If either no
+        # longer matches, the bytes already queued are dropped and the
+        # file is read from the start.
         self.identity = None
         self.prefix = None
         self._fast_lock = threading.Lock()
@@ -223,16 +222,15 @@ class LogTailThread(threading.Thread):
         """Reads and queues every complete line currently available,
         bounded CHUNK_SIZE bytes at a time. Safe to call directly for an
         initial synchronous seed before the background loop starts.
-        A removed, replaced, or shortened file queues RUN_RESET and is
-        read from the start."""
+        A missing or shortened log queues RUN_RESET and is read from
+        the start."""
         queued = 0
         try:
             with open(self.log_path, "rb") as f:
                 st = os.fstat(f.fileno())
                 identity = (st.st_dev, st.st_ino)
-                # The first lines of a new run carry a new socket path.
-                # Comparing them catches a replaced file whose inode was
-                # reused and which is already longer than the old offset.
+                # The opening bytes include the socket path. A mismatch
+                # means the file is read from the start.
                 head = f.read(256) if st.st_size else b""
                 content_changed = bool(self.prefix) and head != self.prefix[:len(head)]
                 replaced = self.identity is not None and (
@@ -266,9 +264,9 @@ class LogTailThread(threading.Thread):
                     if len(chunk) < self.CHUNK_SIZE:
                         break  # caught up to whatever's currently on disk
         except FileNotFoundError:
-            # Removed, and the new file is not there yet. One reset,
-            # then wait. Repeating this while the path is still missing
-            # would clear the chart on every poll.
+            # The log file is not there yet. One reset, then wait.
+            # Repeating this while the path is still missing would
+            # clear the chart on every poll.
             if self.identity is not None:
                 self.identity = None
                 self.prefix = None
@@ -341,7 +339,7 @@ class DatasetBuilder:
         self.normal_total_series = []
         # HostTraceStats::ninst, logged as the field ninst= on table=host.
         self.ninst_series = []
-        # Live-knob channel (PredictorLiveConfig). control_path is the
+        # Live-knob channel. control_path is the
         # socket key. live_series is the numeric trace of each knob.
         # live_latest is the last complete snapshot, in wire form.
         self.control_path = None
@@ -365,7 +363,7 @@ class DatasetBuilder:
         self._live_seen = set()
 
     def reset(self):
-        """Drop every series. The log file was removed or replaced."""
+        """Drop every series. The log file is read from the start."""
         self.__init__()
 
     def _note_pred_sample(self, sd, decode, critical, hit_count):

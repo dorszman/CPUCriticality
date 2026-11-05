@@ -17,7 +17,6 @@
 #include <thread>
 #include <vector>
 
-#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,8 +43,7 @@ void IncrementIfSet(StatCounter* counter) {
 
 // Every PredictorConfig::enableTraceLog line starts with this exact
 // token, deliberately unusual so a consumer (e.g. tools/visualize_trace.py)
-// can grep/filter it out of stdout unambiguously even when the host's
-// own logging is interleaved on the same stream.
+// can pull these lines out of the log file the predictor creates.
 constexpr const char* kTraceLogPrefix = "@@ISQCRIT@@";
 
 // Shared by UpdateIssueqReadyWaitingTime()/Promote(): logs an Acquire() that didn't hit an
@@ -65,14 +63,8 @@ void TraceLogAcquire(std::FILE* stream, const char* table, std::size_t index, bo
                  static_cast<unsigned long long>(evictedTag),
                  static_cast<unsigned long long>(newPc),
                  static_cast<unsigned long long>(decode));
-    // Flush just this one line, on the caller-supplied stream --
-    // deliberately NOT a global stdout buffering-mode change (e.g.
-    // setvbuf), which would affect every OTHER line the host prints to
-    // the SAME stream for unrelated reasons too, forcing an extra flush
-    // syscall on all of it regardless of whether anyone's live-tailing
-    // those lines. Writing to a host-supplied, trace-dedicated stream
-    // (see PredictorConfig::traceLogStream) avoids this entirely when
-    // the host points it somewhere other than its own stdout.
+    // Flush this line on the predictor's own log file, so a reader
+    // sees it without waiting for the file buffer to fill.
     std::fflush(stream);
 }
 
@@ -278,6 +270,27 @@ private:
     unsigned ways_ = 1;
 };
 
+// The knobs the listener may change. The socket line carries these
+// fields; nothing outside this file constructs the struct.
+struct PredictorLiveConfig {
+    bool enablePrediction = true;
+    std::int32_t criticalDistanceCycles = 2;
+    std::int32_t nonCriticalDistanceCycles = 8;
+    std::int32_t promoteCriticalAt = 5;
+    std::int32_t promoteNonCriticalAt = -3;
+    std::int32_t trainCounterMin = -10;
+    std::int32_t trainCounterMax = 40;
+    bool enableCriticalRateGovernor = true;
+    double targetCriticalRate = 0.10;
+    double criticalRateDeadband = 0.01;
+    std::uint32_t criticalRateControlInterval = 1024;
+    std::uint32_t criticalRateRelaxDwellWindows = 4;
+    EvictionPolicy trainingTableEvictionPolicy = EvictionPolicy::kLru;
+    EvictionPolicy predictionTableEvictionPolicy = EvictionPolicy::kDecayedPriorityThenLru;
+    std::uint64_t trainingTableDecayIdleUnit = 128;
+    std::uint64_t predictionTableDecayIdleUnit = 128;
+};
+
 } // namespace
 
 struct CriticalityPredictor::Impl {
@@ -325,65 +338,39 @@ struct CriticalityPredictor::Impl {
         // this value never moves. Later changes are logged from
         // UpdateRateGovernor(); without this initial line a constant
         // threshold never appears in the trace at all.
-        if (cfg.enableTraceLog && cfg.traceLogStream) {
-            std::fprintf(cfg.traceLogStream,
+        if (cfg.enableTraceLog && traceLog_) {
+            std::fprintf(traceLog_,
                          "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
                          kTraceLogPrefix, promoteCriticalAtEffective, 0.0,
                          static_cast<unsigned long long>(lookupCounter));
             // The signed level the counter compares against
             // (promoteNonCriticalAt). Negative in the default config.
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=train event=demote_threshold value=%d decode=%llu\n",
                          kTraceLogPrefix, cfg.promoteNonCriticalAt,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
         StartLiveControl();
     }
 
     ~Impl() {
         StopLiveControl();
-        if (ownedTrace_ != nullptr) {
-            std::fclose(ownedTrace_);
-            ownedTrace_ = nullptr;
+        if (traceLog_ != nullptr) {
+            std::fclose(traceLog_);
+            traceLog_ = nullptr;
         }
-    }
-
-    // Empty a log the host already opened. A shell redirect with ">>"
-    // sets O_APPEND, and writes then ignore the file offset and stick
-    // the new run onto the old bytes. Clearing that flag, then
-    // truncating, makes the next line the first line. A terminal is
-    // left alone.
-    static void ClearTraceFile(std::FILE* stream) {
-        if (stream == nullptr) return;
-        std::fflush(stream);
-        int fd = ::fileno(stream);
-        if (fd < 0) return;
-        struct stat st;
-        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return;
-        int flags = ::fcntl(fd, F_GETFL);
-        if (flags >= 0 && (flags & O_APPEND) != 0) {
-            ::fcntl(fd, F_SETFL, flags & ~O_APPEND);
-        }
-        if (::ftruncate(fd, 0) != 0) return;
-        ::lseek(fd, 0, SEEK_SET);
-        std::fseek(stream, 0, SEEK_SET);
     }
 
     void OpenTraceLog() {
         if (!cfg.enableTraceLog) return;
-        if (cfg.traceLogPath != nullptr && cfg.traceLogPath[0] != '\0') {
-            // Remove the previous run. Truncating the same inode leaves
-            // a reader parked at the old end of the file, so it never
-            // sees the new run as a new file.
-            ::unlink(cfg.traceLogPath);
-            ownedTrace_ = std::fopen(cfg.traceLogPath, "w");
-            if (ownedTrace_ == nullptr) {
-                throw std::runtime_error(std::string("could not open trace log ") + cfg.traceLogPath);
-            }
-            cfg.traceLogStream = ownedTrace_;
+        if (cfg.traceLogPath == nullptr || cfg.traceLogPath[0] == '\0') return;
+        // Create the one log file at this path.
+        ::unlink(cfg.traceLogPath);
+        traceLog_ = std::fopen(cfg.traceLogPath, "w");
+        if (traceLog_ == nullptr) {
+            throw std::runtime_error(std::string("could not open trace log ") + cfg.traceLogPath);
         }
-        ClearTraceFile(cfg.traceLogStream);
     }
 
     // --- Training / prediction tables -----------------------------------
@@ -491,9 +478,9 @@ struct CriticalityPredictor::Impl {
         }
         std::uint32_t total = classWindowCritical + classWindowNonCritical + classWindowNormal;
         if (total < cfg.distanceClassInterval) return;
-        if (cfg.traceLogStream && total != 0) {
+        if (traceLog_ && total != 0) {
             double inv = 1.0 / static_cast<double>(total);
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=train event=distance_class criticalRatio=%.6f "
                          "nonCriticalRatio=%.6f normalRatio=%.6f decode=%llu\n",
                          kTraceLogPrefix,
@@ -501,7 +488,7 @@ struct CriticalityPredictor::Impl {
                          static_cast<double>(classWindowNonCritical) * inv,
                          static_cast<double>(classWindowNormal) * inv,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
         classWindowCritical = 0;
         classWindowNonCritical = 0;
@@ -513,7 +500,7 @@ struct CriticalityPredictor::Impl {
         NoteDistanceClass(waitingTime);
         auto acq = trainTable.Acquire(producerPc);
         TrainEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog ? cfg.traceLogStream : nullptr, "train", acq.index,
+        TraceLogAcquire(cfg.enableTraceLog ? traceLog_ : nullptr, "train", acq.index,
                         acq.wasHit, acq.evictedTag, producerPc, lookupCounter);
 
         if (waitingTime <= cfg.criticalDistanceCycles) {
@@ -525,11 +512,11 @@ struct CriticalityPredictor::Impl {
         }
         IncrementIfSet(statPtrs.trainingEvents);
         if (cfg.enableTraceLog) {
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=train slot=%zu event=update pc=0x%llx count=%d decode=%llu\n",
                          kTraceLogPrefix, acq.index, static_cast<unsigned long long>(producerPc), e.count,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
 
         // promoteCriticalAtEffective == cfg.promoteCriticalAt whenever
@@ -546,18 +533,18 @@ struct CriticalityPredictor::Impl {
     void Promote(Addr pc, bool critical) {
         auto acq = predTable.Acquire(pc); // valid/tag already correct either way
         PredEntry& e = acq.entry;
-        TraceLogAcquire(cfg.enableTraceLog ? cfg.traceLogStream : nullptr, "pred", acq.index,
+        TraceLogAcquire(cfg.enableTraceLog ? traceLog_ : nullptr, "pred", acq.index,
                         acq.wasHit, acq.evictedTag, pc, lookupCounter);
         e.critical = critical;
         if (critical) IncrementIfSet(statPtrs.criticalPromotions);
         else IncrementIfSet(statPtrs.nonCriticalPromotions);
         if (cfg.enableTraceLog) {
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=pred slot=%zu event=%s pc=0x%llx hitCount=%u decode=%llu\n",
                          kTraceLogPrefix, acq.index, critical ? "promote" : "demote",
                          static_cast<unsigned long long>(pc), e.hitCount,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
     }
 
@@ -575,14 +562,14 @@ struct CriticalityPredictor::Impl {
             UpdateRateGovernor(critical);
         }
         if (cfg.enableTraceLog) {
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=pred slot=%lld event=lookup pc=0x%llx critical=%d hitCount=%u decode=%llu\n",
                          kTraceLogPrefix,
                          found.entry ? static_cast<long long>(found.index) : -1LL,
                          static_cast<unsigned long long>(pc), critical ? 1 : 0,
                          found.entry ? found.entry->hitCount : 0u,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
         // Only the RETURNED value is masked -- see
         // PredictorConfig::enablePrediction.
@@ -626,20 +613,20 @@ struct CriticalityPredictor::Impl {
         } else {
             rateGoodWindowStreak = 0; // in the deadband: neutral, not "good"
         }
-        if (cfg.enableTraceLog && cfg.traceLogStream) {
+        if (cfg.enableTraceLog && traceLog_) {
             // Same window the governor just closed. The chart plots this
             // rate and does not keep a second counter of its own.
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=pred event=criticality rate=%.6f decode=%llu\n",
                          kTraceLogPrefix, rate,
                          static_cast<unsigned long long>(lookupCounter));
             if (promoteCriticalAtEffective != before) {
-                std::fprintf(cfg.traceLogStream,
+                std::fprintf(traceLog_,
                              "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
                              kTraceLogPrefix, promoteCriticalAtEffective, rate,
                              static_cast<unsigned long long>(lookupCounter));
             }
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
         rateWindowHits = 0;
         rateWindowTotal = 0;
@@ -648,11 +635,11 @@ struct CriticalityPredictor::Impl {
 
     void TraceLogHostStats(const HostTraceStats& stats) const {
         if (!cfg.enableTraceLog) return;
-        std::fprintf(cfg.traceLogStream,
+        std::fprintf(traceLog_,
                      "%s table=host ninst=%lld decode=%llu\n",
                      kTraceLogPrefix, static_cast<long long>(stats.ninst),
                      static_cast<unsigned long long>(lookupCounter));
-        std::fflush(cfg.traceLogStream);
+        std::fflush(traceLog_);
     }
 
     // --- Live knobs ------------------------------------------------------
@@ -666,7 +653,7 @@ struct CriticalityPredictor::Impl {
     std::atomic<bool> liveStop_{false};
     std::atomic<int> liveClientFd_{-1};
     int liveListenFd_ = -1;
-    std::FILE* ownedTrace_ = nullptr;
+    std::FILE* traceLog_ = nullptr;
     std::string livePath_;
     std::thread liveThread_;
 
@@ -809,9 +796,9 @@ struct CriticalityPredictor::Impl {
     }
 
     void DumpLive() const {
-        if (!cfg.enableTraceLog || !cfg.traceLogStream) return;
+        if (!cfg.enableTraceLog || !traceLog_) return;
         PredictorLiveConfig s = SnapshotLive();
-        std::fprintf(cfg.traceLogStream,
+        std::fprintf(traceLog_,
                      "%s table=live enablePrediction=%d criticalDistanceCycles=%d "
                      "nonCriticalDistanceCycles=%d promoteCriticalAt=%d promoteNonCriticalAt=%d "
                      "trainCounterMin=%d trainCounterMax=%d enableCriticalRateGovernor=%d "
@@ -838,7 +825,7 @@ struct CriticalityPredictor::Impl {
                      static_cast<unsigned long long>(s.trainingTableDecayIdleUnit),
                      static_cast<unsigned long long>(s.predictionTableDecayIdleUnit),
                      static_cast<unsigned long long>(lookupCounter));
-        std::fflush(cfg.traceLogStream);
+        std::fflush(traceLog_);
     }
 
     void ApplyLiveNow(const PredictorLiveConfig& live) const {
@@ -886,24 +873,24 @@ struct CriticalityPredictor::Impl {
         // chart keeps the old value and then looks frozen, because a
         // threshold already sitting on the new max does not move again
         // until the rate falls under the cap.
-        if (cfg.enableTraceLog && cfg.traceLogStream &&
+        if (cfg.enableTraceLog && traceLog_ &&
             promoteCriticalAtEffective != effectiveBefore) {
             double rate = rateWindowTotal == 0
                               ? 0.0
                               : static_cast<double>(rateWindowHits) / rateWindowTotal;
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=train event=effective_change value=%d rate=%.4f decode=%llu\n",
                          kTraceLogPrefix, promoteCriticalAtEffective, rate,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
-        if (cfg.enableTraceLog && cfg.traceLogStream &&
+        if (cfg.enableTraceLog && traceLog_ &&
             cfg.promoteNonCriticalAt != demoteBefore) {
-            std::fprintf(cfg.traceLogStream,
+            std::fprintf(traceLog_,
                          "%s table=train event=demote_threshold value=%d decode=%llu\n",
                          kTraceLogPrefix, cfg.promoteNonCriticalAt,
                          static_cast<unsigned long long>(lookupCounter));
-            std::fflush(cfg.traceLogStream);
+            std::fflush(traceLog_);
         }
         DumpLive();
     }
@@ -918,16 +905,6 @@ struct CriticalityPredictor::Impl {
             if (job.apply && LiveConfigOk(job.cfg)) ApplyLiveNow(job.cfg);
             else DumpLive();
         }
-    }
-
-    bool ApplyFromSimThread(const PredictorLiveConfig& live) {
-        DrainLiveUpdates();
-        if (!LiveConfigOk(live)) {
-            DumpLive();
-            return false;
-        }
-        ApplyLiveNow(live);
-        return true;
     }
 
     static void WriteReply(int fd, const char* text) {
@@ -1022,7 +999,7 @@ struct CriticalityPredictor::Impl {
     }
 
     void StartLiveControl() {
-        if (!cfg.enableTraceLog || !cfg.traceLogStream) return;
+        if (!cfg.enableTraceLog || !traceLog_) return;
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return;
         static std::atomic<std::uint32_t> seq{0};
@@ -1047,11 +1024,11 @@ struct CriticalityPredictor::Impl {
         }
         ::chmod(livePath_.c_str(), 0600);
         liveListenFd_ = fd;
-        std::fprintf(cfg.traceLogStream,
+        std::fprintf(traceLog_,
                      "%s table=control path=%s decode=%llu\n",
                      kTraceLogPrefix, livePath_.c_str(),
                      static_cast<unsigned long long>(lookupCounter));
-        std::fflush(cfg.traceLogStream);
+        std::fflush(traceLog_);
         DumpLive();
         liveThread_ = std::thread([this] { ControlLoop(); });
     }
@@ -1095,10 +1072,6 @@ void CriticalityPredictor::SetupStats(const PredictorStatPointers& counters) {
 
 void CriticalityPredictor::TraceLogHostStats(const HostTraceStats& stats) {
     impl_->TraceLogHostStats(stats);
-}
-
-bool CriticalityPredictor::ApplyLiveConfig(const PredictorLiveConfig& live) {
-    return impl_->ApplyFromSimThread(live);
 }
 
 } // namespace ISQCrit
