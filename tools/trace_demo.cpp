@@ -86,8 +86,8 @@ int main(int argc, char** argv) {
     // needs to clear THAT, not just be "a few steps above the floor",
     // or the effective threshold hits its own ceiling before it's
     // actually strict enough to filter most PCs out.
-    cfg.predictor.promoteCriticalAt = 2;
-    cfg.predictor.promoteNonCriticalAt = -2;
+    cfg.predictor.promoteCriticalAt = 10;
+    cfg.predictor.promoteNonCriticalAt = -10;
     cfg.predictor.trainCounterMin = -40;
     cfg.predictor.trainCounterMax = 40;
 

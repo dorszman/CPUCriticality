@@ -76,8 +76,8 @@ struct PredictorConfig {
     // replacement policy (LRU within the set) once a set is full. Must
     // be >= 1 -- CriticalityPredictor's constructor throws
     // std::invalid_argument if either is 0.
-    unsigned trainingTableWays = 1;
-    unsigned predictionTableWays = 1;
+    unsigned trainingTableWays = 4;
+    unsigned predictionTableWays = 4;
 
     // Which policy the training table uses to pick a victim once a set
     // is full (only matters when trainingTableWays > 1 and a set is
@@ -116,13 +116,13 @@ struct PredictorConfig {
     std::int32_t nonCriticalDistanceCycles = 8;
 
     // Saturating range for the per-PC training counter.
-    std::int32_t trainCounterMin = -4;
-    std::int32_t trainCounterMax = 3;
+    std::int32_t trainCounterMin = -10;
+    std::int32_t trainCounterMax = 10;
 
     // Training-counter thresholds at which a PC is (re-)promoted into the
     // prediction table as critical / non-critical.
-    std::int32_t promoteCriticalAt = 2;
-    std::int32_t promoteNonCriticalAt = -2;
+    std::int32_t promoteCriticalAt = 5;
+    std::int32_t promoteNonCriticalAt = -3;
 
     // Criticality-rate governor: a one-sided CAP (never a target to hit
     // exactly) on the fraction of IsPredictedCritical() lookups that
@@ -164,12 +164,13 @@ struct PredictorConfig {
     // overshoot the cap by 5-7x on realistic workloads, no matter how
     // criticalRateRelaxDwellWindows is tuned. With >=5-6 steps of
     // headroom, the same mechanism converges cleanly near the cap. This
-    // project's OWN baseline defaults (promoteCriticalAt=2,
-    // trainCounterMax=3) are exactly the bad case -- only one notch of
-    // headroom -- so raise trainCounterMax well above promoteCriticalAt
-    // specifically when enabling this governor; the defaults are tuned
-    // for hysteresis depth alone and were never validated against this
-    // mechanism.
+    // project's OWN baseline defaults (promoteCriticalAt=5,
+    // trainCounterMax=10) give exactly 5 steps of headroom -- right at
+    // the low edge of the validated-good range, not the bad case
+    // anymore, but still worth raising trainCounterMax further above
+    // promoteCriticalAt if your workload's own data shows the governor
+    // still overshooting; the defaults are tuned for hysteresis depth
+    // alone and were never validated end-to-end against this mechanism.
     bool enableCriticalRateGovernor = false;
     double targetCriticalRate = 0.10;     // the cap, e.g. 0.10 == 10%
     double criticalRateDeadband = 0.01;   // +/- band around the cap with no adjustment
