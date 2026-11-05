@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """Turns a CriticalityConfig::enableTraceLog log into an interactive
 matplotlib window showing training-table and prediction-table behavior
-over time -- a native plot window (TkAgg), not a browser page: use the
-toolbar's pan/zoom-to-box/home buttons to navigate, and the per-table
-radio buttons to switch which of the 8 tracked slots is shown.
+over time -- a native plot window (TkAgg), not a browser page. The
+x-axis starts at twice the samples seen so far. The toolbar zoom
+and pan work; they hold until Home, which returns to that widest
+view. The per-table radio buttons switch
+which of the 8 tracked slots is shown.
 
 Live: a background thread continuously reads new complete lines from
 the log file (in bounded chunks, never one unbounded read) and pushes
-their parsed events into a thread-safe queue. The GUI's periodic
-redraw (default every 1s) only ever drains that queue -- a few
-in-memory queue.get_nowait() calls -- and never touches the filesystem
-itself, so the GUI can never block on disk I/O or on how large the log
-has grown, no matter how slow the reader thread or how bursty the
-writer is. Your pan/zoom position is preserved across redraws -- it
-only resets when you switch slots. For this to actually show anything
+their parsed events into a thread-safe queue. The GUI drains that
+queue on the Tk event loop -- a few in-memory queue.get_nowait() calls
+-- and never touches the filesystem itself, so the GUI can never block
+on disk I/O or on how large the log has grown. As soon as new lines are
+queued they are appended and painted; there is no redraw timer. Lines
+are created once. A redraw appends only the samples
+that arrived since the previous frame, and sets the x-axis to twice
+the samples seen so far, so the trace fills the left half and the
+right half stays empty for what arrives next. It does not clear the
+axes, rebuild the legend, or walk the history again.
+Zoom and pan hold until Home, which snaps back to twice the samples
+seen at that moment and follows the stream again.
+Switching slots points the same lines at that slot's series.
+For this to actually show anything
 live, each trace line is fflush()'d individually by the writer (see
 PredictorConfig::traceLogStream in src/criticality_predictor.h) --
 otherwise the OS wouldn't see new bytes until the writer's internal
@@ -67,7 +76,7 @@ def parse_line(line):
             fields[key] = int(value, 16)
         elif key in FLOAT_FIELDS:
             fields[key] = float(value)
-        elif key in ("table", "event", "name"):
+        elif key in ("table", "event"):
             fields[key] = value
         else:
             fields[key] = int(value)
@@ -99,7 +108,7 @@ class LogTailThread(threading.Thread):
     """
 
     CHUNK_SIZE = 1 << 16  # 64 KiB per read -- bounds each individual read's cost
-    POLL_INTERVAL = 0.05  # seconds between checks for newly-appended data
+    POLL_INTERVAL = 0.001  # only used when the file has nothing new
 
     def __init__(self, log_path):
         super().__init__(daemon=True)
@@ -110,8 +119,11 @@ class LogTailThread(threading.Thread):
 
     def run(self):
         while not self._stop.is_set():
-            self.drain_file_once()
-            time.sleep(self.POLL_INTERVAL)
+            # New bytes are queued immediately. Sleep only when the
+            # writer has not appended anything yet.
+            if self.drain_file_once() == 0:
+                if self._stop.wait(self.POLL_INTERVAL):
+                    break
 
     def stop(self):
         self._stop.set()
@@ -120,6 +132,7 @@ class LogTailThread(threading.Thread):
         """Reads and queues every complete line currently available,
         bounded CHUNK_SIZE bytes at a time. Safe to call directly for an
         initial synchronous seed before the background loop starts."""
+        queued = 0
         try:
             with open(self.log_path, "rb") as f:
                 f.seek(self.pos)
@@ -137,10 +150,12 @@ class LogTailThread(threading.Thread):
                             fields = parse_line(line)
                             if fields is not None:
                                 self.queue.put(fields)
+                                queued += 1
                     if len(chunk) < self.CHUNK_SIZE:
                         break  # caught up to whatever's currently on disk
         except FileNotFoundError:
             pass  # writer hasn't created the file yet; next poll tries again
+        return queued
 
     def drain_available(self):
         """Non-blocking: returns every event currently queued, or []."""
@@ -181,10 +196,8 @@ class DatasetBuilder:
         self.effective_series = []       # global: [(x, y)]
         self.demote_threshold_series = []  # global: positive magnitude
         self.critical_ratio_series = []  # global: [(x, y)]
-        # Arbitrary host-reported stats (TokenEngine::TraceLogStat), e.g.
-        # "ninst" -- name -> [(x, y)]. Generic on purpose: whatever name
-        # the host logs just shows up here, no new wiring needed per stat.
-        self.host_stats = {}
+        # HostTraceStats::ninst, logged as the field ninst= on table=host.
+        self.ninst_series = []
 
         self._train_promote_cum = {i: 0 for i in range(NUM_TRACK_SLOTS)}
         self._train_demote_cum = {i: 0 for i in range(NUM_TRACK_SLOTS)}
@@ -216,8 +229,8 @@ class DatasetBuilder:
                 self.demote_threshold_series.append((decode, ev["value"]))
                 continue
 
-            if table == "host" and event == "stat":
-                self.host_stats.setdefault(ev["name"], []).append((decode, ev["value"]))
+            if table == "host" and "ninst" in ev:
+                self.ninst_series.append((decode, ev["ninst"]))
                 continue
 
             if table == "train":
@@ -274,18 +287,10 @@ class DatasetBuilder:
                             tsd.demote_cum.append((decode, self._train_demote_cum[train_slot]))
 
 
-def _xy(series):
-    if not series:
-        return [], []
-    xs, ys = zip(*series)
-    return list(xs), list(ys)
-
-
 def show(log_thread, interval_seconds):
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
     from matplotlib.widgets import RadioButtons
 
     fig = plt.figure(figsize=(10.5, 7))
@@ -315,119 +320,172 @@ def show(log_thread, interval_seconds):
     dataset.feed(log_thread.drain_available())
 
     ui = {"train_slot": 0, "pred_slot": 0}
+    # True until the user pans or zooms that chart. Home sets both back.
+    follow = {"train": True, "pred": True}
+    applying = {"n": 0}
 
-    def draw_pc_markers(ax, pc_changes):
-        for decode, pc in pc_changes:
-            ax.axvline(decode, color="#ffa726", linestyle="--", linewidth=1, alpha=0.5)
+    def note_user_zoom(which):
+        def on_xlim(_event):
+            if applying["n"] == 0:
+                follow[which] = False
+        return on_xlim
 
-    def draw_train(slot_idx, preserve_view):
-        view = None
-        if preserve_view:
-            view = (ax_train.get_xlim(), ax_train.get_ylim(), ax_train_r.get_ylim(),
-                     ax_train_r2.get_ylim())
-        ax_train.clear()
-        ax_train_r.clear()
-        ax_train_r2.clear()
+    ax_train.callbacks.connect("xlim_changed", note_user_zoom("train"))
+    ax_pred.callbacks.connect("xlim_changed", note_user_zoom("pred"))
+
+    def grow_ylim(ax, hi, bottom=0.0):
+        # Expand only. Shrinking the axis on every frame is a jump.
+        top = max(hi * 1.1, 1.0)
+        lo, cur = ax.get_ylim()
+        if cur < top or lo > bottom:
+            ax.set_ylim(bottom, max(top, cur))
+
+    def widen(ax, end_x):
+        # Twice the samples so far: the trace occupies the left half
+        # and the right half is room for the next live batches.
+        span = max(end_x, 1)
+        applying["n"] += 1
+        try:
+            ax.set_xlim(0, span * 2)
+        finally:
+            applying["n"] -= 1
+
+    # Artists are created once. Each line remembers how much of its
+    # source series is already on screen and only appends the new tail.
+    made = {"ok": False}
+    shown = {}
+
+    def push(line, key, slot, series, ymap=None, max_points=2500):
+        st = shown.get(key)
+        if st is None or st[0] != slot:
+            dx, dy, n, ymax = [], [], 0, 0.0
+            changed = True
+        else:
+            _, n, dx, dy, ymax = st
+            changed = False
+        if n < len(series):
+            changed = True
+            for i in range(n, len(series)):
+                x, y = series[i]
+                if ymap is not None:
+                    y = ymap(y)
+                dx.append(x)
+                dy.append(y)
+                if y > ymax:
+                    ymax = y
+            n = len(series)
+            if len(dx) > max_points:
+                step = max(1, len(dx) // max_points)
+                dx = dx[::step]
+                dy = dy[::step]
+                x, y = series[-1]
+                if ymap is not None:
+                    y = ymap(y)
+                if not dx or dx[-1] != x:
+                    dx.append(x)
+                    dy.append(y)
+        if changed:
+            line.set_data(dx, dy)
+        shown[key] = (slot, n, dx, dy, ymax)
+        return ymax, (dx[-1] if dx else 0)
+    marks = {"train_slot": None, "train": [], "pred_slot": None, "pred": []}
+
+    def sync_marks(ax, key, slot_idx, pc_changes):
+        if marks[key + "_slot"] != slot_idx:
+            for ln in marks[key]:
+                ln.remove()
+            marks[key] = []
+            marks[key + "_slot"] = slot_idx
+        have = len(marks[key])
+        for decode, _pc in pc_changes[have:]:
+            marks[key].append(ax.axvline(decode, color="#ffa726", linestyle="--",
+                                          linewidth=1, alpha=0.5))
+
+    def draw_train(slot_idx, preserve_view=False):
+        if not made["ok"]:
+            made["count"], = ax_train.plot(
+                [], [], drawstyle="steps-post", color="#1f77b4", label="count", linewidth=1.5)
+            made["demote"], = ax_train.plot(
+                [], [], drawstyle="steps-post", color="#e67e22", label="demotion", linewidth=1.5)
+            made["thr"], = ax_train.plot(
+                [], [], drawstyle="steps-post", color="#444444", linestyle=":",
+                label="effective promote threshold", linewidth=1.6)
+            made["dthr"], = ax_train.plot(
+                [], [], drawstyle="steps-post", color="#e67e22", linestyle=":",
+                label="demote threshold", linewidth=1.6)
+            made["prom"], = ax_train_r.plot(
+                [], [], drawstyle="steps-post", color="#2ca02c", label="cumulative promotes", linewidth=1.5)
+            made["demc"], = ax_train_r.plot(
+                [], [], drawstyle="steps-post", color="#d62728", label="cumulative demotes", linewidth=1.5)
+            made["ninst_t"], = ax_train_r2.plot(
+                [], [], color="#9467bd", label="ninst (retired)", linewidth=1.2)
+            ax_train.set_xlabel("decoded instructions")
+            ax_train.set_ylabel("count / threshold")
+            ax_train_r.set_ylabel("cumulative events")
+            ax_train_r2.set_ylabel("ninst (retired instructions)")
+            h1, l1 = ax_train.get_legend_handles_labels()
+            h2, l2 = ax_train_r.get_legend_handles_labels()
+            h3, l3 = ax_train_r2.get_legend_handles_labels()
+            ax_train.legend(h1 + h2 + h3, l1 + l2 + l3, loc="upper left", fontsize=8)
+            ax_train.grid(True, alpha=0.2)
+            made["crit"], = ax_pred.plot(
+                [], [], drawstyle="steps-post", color="#1f77b4", label="critical bit", linewidth=1.5)
+            made["ratio"], = ax_pred.plot(
+                [], [], color="#888888", linestyle=":",
+                label="overall critical/total ratio", linewidth=1.2)
+            made["hits"], = ax_pred_r.plot(
+                [], [], drawstyle="steps-post", color="#ff7f0e", label="hitCount", linewidth=1.5)
+            made["ninst_p"], = ax_pred_r2.plot(
+                [], [], color="#9467bd", label="ninst (retired)", linewidth=1.2)
+            ax_pred.set_ylim(-0.05, 1.1)
+            ax_pred.set_xlabel("decoded instructions")
+            ax_pred.set_ylabel("critical bit / ratio")
+            ax_pred_r.set_ylabel("hitCount")
+            ax_pred_r2.set_ylabel("ninst (retired instructions)")
+            h1, l1 = ax_pred.get_legend_handles_labels()
+            h2, l2 = ax_pred_r.get_legend_handles_labels()
+            h3, l3 = ax_pred_r2.get_legend_handles_labels()
+            ax_pred.legend(h1 + h2 + h3, l1 + l2 + l3, loc="upper left", fontsize=8)
+            ax_pred.grid(True, alpha=0.2)
+            made["ok"] = True
+
         sd = dataset.train_slots[slot_idx]
-
-        draw_pc_markers(ax_train, sd.pc_changes)
-
-        xs, raw = _xy(sd.count_series)
-        # The counter itself runs negative to reach a demotion. Draw that
-        # depth upward so a demotion is a positive number on this axis.
-        count_y = [y if y > 0 else 0 for y in raw]
-        demote_y = [-y if y < 0 else 0 for y in raw]
-        ax_train.step(xs, count_y, where="post", color="#1f77b4", label="count", linewidth=1.5)
-        ax_train.step(xs, demote_y, where="post", color="#e67e22", label="demotion", linewidth=1.5)
-
-        end_x = xs[-1] if xs else 0
-        for series in (sd.count_series, sd.promote_cum, sd.demote_cum,
-                       dataset.effective_series, dataset.demote_threshold_series,
-                       dataset.host_stats.get("ninst", [])):
-            if series:
-                end_x = max(end_x, series[-1][0])
-
-        def stretch(series):
-            sx, sy = _xy(series)
-            if sx and end_x > sx[-1]:
-                sx = list(sx) + [end_x]
-                sy = list(sy) + [sy[-1]]
-            return sx, sy
-
-        xs, ys = stretch(dataset.effective_series)
-        ax_train.step(xs, ys, where="post", color="#444444", linestyle=":",
-                       label="effective promote threshold", linewidth=1.6)
-        xs, ys = stretch(dataset.demote_threshold_series)
-        ax_train.step(xs, ys, where="post", color="#e67e22", linestyle=":",
-                       label="demote threshold", linewidth=1.6)
-
-        xs, ys = _xy(sd.promote_cum)
-        ax_train_r.step(xs, ys, where="post", color="#2ca02c", label="cumulative promotes", linewidth=1.5)
-        xs, ys = _xy(sd.demote_cum)
-        ax_train_r.step(xs, ys, where="post", color="#d62728", label="cumulative demotes", linewidth=1.5)
-
-        xs, ys = _xy(dataset.host_stats.get("ninst", []))
-        ax_train_r2.plot(xs, ys, color="#9467bd", label="ninst (retired)", linewidth=1.2)
-
+        sync_marks(ax_train, "train", slot_idx, sd.pc_changes)
+        cmax, cx = push(made["count"], "count", slot_idx, sd.count_series,
+                        ymap=lambda y: y if y > 0 else 0)
+        dmax, _dx = push(made["demote"], "demote", slot_idx, sd.count_series,
+                         ymap=lambda y: -y if y < 0 else 0)
+        tmax, tx = push(made["thr"], "thr", "g", dataset.effective_series)
+        dtmax, dtx = push(made["dthr"], "dthr", "g", dataset.demote_threshold_series)
+        pmax, px = push(made["prom"], "prom", slot_idx, sd.promote_cum)
+        dmmax, dmx = push(made["demc"], "demc", slot_idx, sd.demote_cum)
+        nmax, nx = push(made["ninst_t"], "ninst_t", "g", dataset.ninst_series)
+        end_x = max(cx, tx, dtx, px, dmx, nx)
         ax_train.set_title(f"Training table -- Slot {slot_idx}")
-        ax_train.set_xlabel("decoded instructions")
-        ax_train.set_ylabel("count / threshold")
-        ax_train_r.set_ylabel("cumulative events")
-        ax_train_r2.set_ylabel("ninst (retired instructions)")
-        lines1, labels1 = ax_train.get_legend_handles_labels()
-        lines2, labels2 = ax_train_r.get_legend_handles_labels()
-        lines3, labels3 = ax_train_r2.get_legend_handles_labels()
-        ax_train.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3,
-                         loc="upper left", fontsize=8)
-        ax_train.grid(True, alpha=0.2)
-        if view is not None:
-            ax_train.set_xlim(view[0])
-            ax_train.set_ylim(view[1])
-            ax_train_r.set_ylim(view[2])
-            ax_train_r2.set_ylim(view[3])
+        grow_ylim(ax_train, max(cmax, dmax, tmax, dtmax))
+        grow_ylim(ax_train_r, max(pmax, dmmax))
+        if nmax:
+            grow_ylim(ax_train_r2, nmax)
+        if follow["train"]:
+            widen(ax_train, end_x)
         fig.canvas.draw_idle()
 
-    def draw_pred(slot_idx, preserve_view):
-        view = None
-        if preserve_view:
-            view = (ax_pred.get_xlim(), ax_pred.get_ylim(), ax_pred_r.get_ylim(),
-                     ax_pred_r2.get_ylim())
-        ax_pred.clear()
-        ax_pred_r.clear()
-        ax_pred_r2.clear()
+    def draw_pred(slot_idx, preserve_view=False):
+        if not made["ok"]:
+            draw_train(ui["train_slot"])
         sd = dataset.pred_slots[slot_idx]
-
-        draw_pc_markers(ax_pred, sd.pc_changes)
-
-        xs, ys = _xy(sd.critical_series)
-        ax_pred.step(xs, ys, where="post", color="#1f77b4", label="critical bit", linewidth=1.5)
-        xs, ys = _xy(dataset.critical_ratio_series)
-        ax_pred.plot(xs, ys, color="#888888", linestyle=":",
-                      label="overall critical/total ratio", linewidth=1.2)
-        ax_pred.set_ylim(-0.05, 1.1)
-
-        xs, ys = _xy(sd.hitcount_series)
-        ax_pred_r.step(xs, ys, where="post", color="#ff7f0e", label="hitCount", linewidth=1.5)
-
-        xs, ys = _xy(dataset.host_stats.get("ninst", []))
-        ax_pred_r2.plot(xs, ys, color="#9467bd", label="ninst (retired)", linewidth=1.2)
-
+        sync_marks(ax_pred, "pred", slot_idx, sd.pc_changes)
+        _cmax, cx = push(made["crit"], "crit", slot_idx, sd.critical_series)
+        _rmax, rx = push(made["ratio"], "ratio", "g", dataset.critical_ratio_series)
+        hmax, hx = push(made["hits"], "hits", slot_idx, sd.hitcount_series)
+        nmax, nx = push(made["ninst_p"], "ninst_p", "g", dataset.ninst_series)
         ax_pred.set_title(f"Prediction table -- Slot {slot_idx}")
-        ax_pred.set_xlabel("decoded instructions")
-        ax_pred.set_ylabel("critical bit / ratio")
-        ax_pred_r.set_ylabel("hitCount")
-        ax_pred_r2.set_ylabel("ninst (retired instructions)")
-        lines1, labels1 = ax_pred.get_legend_handles_labels()
-        lines2, labels2 = ax_pred_r.get_legend_handles_labels()
-        lines3, labels3 = ax_pred_r2.get_legend_handles_labels()
-        ax_pred.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3,
-                        loc="upper left", fontsize=8)
-        ax_pred.grid(True, alpha=0.2)
-        if view is not None:
-            ax_pred.set_xlim(view[0])
-            ax_pred.set_ylim(view[1])
-            ax_pred_r.set_ylim(view[2])
-            ax_pred_r2.set_ylim(view[3])
+        if hmax:
+            grow_ylim(ax_pred_r, hmax)
+        if nmax:
+            grow_ylim(ax_pred_r2, nmax)
+        if follow["pred"]:
+            widen(ax_pred, max(cx, rx, hx, nx))
         fig.canvas.draw_idle()
 
     def on_train_radio(label):
@@ -444,21 +502,44 @@ def show(log_thread, interval_seconds):
     draw_train(ui["train_slot"], preserve_view=False)
     draw_pred(ui["pred_slot"], preserve_view=False)
 
-    def refresh(_frame):
-        new_events = log_thread.drain_available()  # non-blocking: in-memory queue only
-        if not new_events:
-            return ()
-        dataset.feed(new_events)
-        draw_train(ui["train_slot"], preserve_view=True)
-        draw_pred(ui["pred_slot"], preserve_view=True)
-        return ()
+    # Paint as soon as the reader has queued new lines. One paint
+    # includes every line that arrived since the previous paint, then
+    # the next check is scheduled. Nothing waits on a redraw timer.
+    gap_ms = 1 if interval_seconds <= 0 else max(1, int(interval_seconds * 1000))
 
-    # Keep a reference on fig itself -- FuncAnimation is only kept alive
-    # by whoever holds a reference to it, and a bare local would be
-    # garbage-collected (silently stopping the timer) the moment show()
-    # returns control to plt.show()'s own event loop.
-    fig._live_anim = FuncAnimation(fig, refresh, interval=int(interval_seconds * 1000),
-                                    cache_frame_data=False)
+    def pump():
+        if not plt.fignum_exists(fig.number):
+            return
+        new_events = log_thread.drain_available()
+        if new_events:
+            dataset.feed(new_events)
+            draw_train(ui["train_slot"], preserve_view=False)
+            draw_pred(ui["pred_slot"], preserve_view=False)
+        window = getattr(getattr(fig.canvas, "manager", None), "window", None)
+        if window is not None:
+            window.after(gap_ms, pump)
+
+    toolbar = getattr(getattr(fig.canvas, "manager", None), "toolbar", None)
+    if toolbar is not None and hasattr(toolbar, "home"):
+        def home(*args, **kwargs):
+            # Back to the widest view: twice the samples that exist now.
+            # Later frames keep following the stream until the next zoom.
+            follow["train"] = True
+            follow["pred"] = True
+            draw_train(ui["train_slot"], preserve_view=False)
+            draw_pred(ui["pred_slot"], preserve_view=False)
+
+        toolbar.home = home
+        buttons = getattr(toolbar, "_buttons", {})
+        # The toolbar captured the original bound method when its
+        # buttons were built, so replacing the attribute is not enough.
+        home_button = buttons.get("Home")
+        if home_button is not None:
+            home_button.configure(command=home)
+
+    window = getattr(getattr(fig.canvas, "manager", None), "window", None)
+    if window is not None:
+        window.after(gap_ms, pump)
 
     plt.show()
     log_thread.stop()
@@ -468,19 +549,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="Live/static viewer for an ISQCrit CriticalityConfig::enableTraceLog log.")
     parser.add_argument("logfile")
-    parser.add_argument("--interval", type=float, default=1.0,
-                         help="Seconds between GUI redraws while the window is open (default: 1.0). "
-                              "The background reader polls the file independently, every 0.05s.")
+    parser.add_argument("--interval", type=float, default=0.0,
+                         help="Minimum seconds between paints. 0 (default) paints as soon as "
+                              "new lines have been read.")
     args = parser.parse_args()
 
     log_thread = LogTailThread(args.logfile)
     log_thread.drain_file_once()  # one synchronous pass to seed the initial view
     if log_thread.queue.qsize():
         print(f"Found {log_thread.queue.qsize()} trace lines already in {args.logfile}; "
-              f"opening plot window (redrawing every {args.interval:g}s)...")
+              f"opening plot window (drawing each new line as it arrives)...")
     else:
         print(f"{args.logfile} has no '{TRACE_PREFIX}' lines yet -- opening plot window and "
-              f"waiting for data (redrawing every {args.interval:g}s)...")
+              f"waiting for data (drawing each new line as it arrives)...")
     log_thread.start()
 
     show(log_thread, args.interval)

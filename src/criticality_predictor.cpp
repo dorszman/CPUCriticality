@@ -521,11 +521,11 @@ struct CriticalityPredictor::Impl {
         rateWindowTotal = 0;
     }
 
-    void TraceLogStat(const char* name, std::int64_t value) const {
+    void TraceLogHostStats(const HostTraceStats& stats) const {
         if (!cfg.enableTraceLog) return;
         std::fprintf(cfg.traceLogStream,
-                     "%s table=host event=stat name=%s value=%lld decode=%llu\n",
-                     kTraceLogPrefix, name, static_cast<long long>(value),
+                     "%s table=host ninst=%lld decode=%llu\n",
+                     kTraceLogPrefix, static_cast<long long>(stats.ninst),
                      static_cast<unsigned long long>(lookupCounter));
         std::fflush(cfg.traceLogStream);
     }
@@ -548,8 +548,8 @@ void CriticalityPredictor::SetupStats(const PredictorStatPointers& counters) {
     impl_->statPtrs = counters;
 }
 
-void CriticalityPredictor::TraceLogStat(const char* name, std::int64_t value) {
-    impl_->TraceLogStat(name, value);
+void CriticalityPredictor::TraceLogHostStats(const HostTraceStats& stats) {
+    impl_->TraceLogHostStats(stats);
 }
 
 } // namespace ISQCrit

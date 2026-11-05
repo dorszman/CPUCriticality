@@ -8,11 +8,20 @@
 // Build: g++ -std=c++17 -Isrc tools/trace_demo_defaults.cpp src/token_engine.cpp src/criticality_predictor.cpp src/token.cpp -o trace_demo_defaults
 // Run:   ./trace_demo_defaults > /tmp/trace_defaults.log
 //        python3 tools/visualize_trace.py /tmp/trace_defaults.log
+//
+// Slow, for watching the viewer update live. Each DoEdge is one
+// instruction, paced at 1000 per second (1 ms apart) so the chart
+// advances in small steps instead of one burst per second:
+//   ./trace_demo_defaults --slow > /tmp/trace_live.log
+//   python3 tools/visualize_trace.py /tmp/trace_live.log
 
 #include "token_engine.h"
 
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <random>
+#include <thread>
 
 using namespace ISQCrit;
 
@@ -32,9 +41,18 @@ void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance) {
     engine.IsPredictedCritical(pc);
 }
 
+// 1000 instructions per second, spread evenly so each viewer frame
+// (default 0.1s) sees a small step rather than a 1000-instruction burst.
+constexpr auto kSlowPace = std::chrono::milliseconds(1);
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool slow = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--slow") == 0) slow = true;
+    }
+
     CriticalityConfig cfg;
     cfg.tokenAssignInterval = 1; // token-sampling knob, not a PredictorConfig default
     cfg.predictor.enableTraceLog = true; // only override: need output at all
@@ -60,6 +78,7 @@ int main() {
             for (int r = 0; r < criticalReps + nonCriticalReps; ++r) {
                 std::int64_t distance = (r < criticalReps) ? 1 : 12;
                 DoEdge(engine, pc, t, distance);
+                if (slow) std::this_thread::sleep_for(kSlowPace);
             }
         }
     }

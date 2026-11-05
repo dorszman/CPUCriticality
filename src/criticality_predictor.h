@@ -235,6 +235,14 @@ struct PredictorStatPointers {
     StatCounter* nonCriticalPromotions = nullptr;
 };
 
+// One snapshot of counters the HOST model already has. Field names are
+// the host's names. This predictor does not compute any of them; it
+// only copies the values onto the trace so they share the lookup-count
+// x-axis with the training and prediction lines.
+struct HostTraceStats {
+    std::int64_t ninst = 0; // retired instructions
+};
+
 class CriticalityPredictor {
 public:
     // Throws std::invalid_argument for any of the structural/divisor
@@ -273,16 +281,13 @@ public:
     void SetupStats(const PredictorStatPointers& counters);
 
     // Debugging/visualization aid only, same spirit as enableTraceLog --
-    // a no-op unless it's enabled. Lets the host log an arbitrary named
-    // stat it tracks itself (retired instruction count, IPC, whatever)
-    // through the SAME trace stream, tagged with this predictor's own
-    // internal call counter so it lines up on the same X axis as every
-    // other trace line (see tools/visualize_trace.py). This predictor
-    // has no notion of "retirement" or any other host-side concept
-    // itself -- it never computes or interprets 'value', only logs it.
-    // Safe to call at any rate the host finds convenient; each call is
-    // one trace line.
-    void TraceLogStat(const char* name, std::int64_t value);
+    // a no-op unless it's enabled. The host fills HostTraceStats from
+    // its own counters (stats.ninst = retired instruction count) and
+    // this writes one trace line tagged with the predictor's lookup
+    // counter, so the viewer can plot it on the same x-axis. The
+    // predictor never interprets the fields. Safe to call at any rate
+    // the host finds convenient.
+    void TraceLogHostStats(const HostTraceStats& stats);
 
 private:
     struct Impl;

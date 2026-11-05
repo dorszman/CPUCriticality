@@ -160,8 +160,8 @@ void TokenEngine::SetupStats(const CriticalityStatPointers& counters) {
     impl_->predictor.SetupStats(counters.predictor);
 }
 
-void TokenEngine::TraceLogStat(const char* name, std::int64_t value) {
-    impl_->predictor.TraceLogStat(name, value);
+void TokenEngine::TraceLogHostStats(const HostTraceStats& stats) {
+    impl_->predictor.TraceLogHostStats(stats);
 }
 
 bool TokenEngine::UpdateCriticality(Token* token) {

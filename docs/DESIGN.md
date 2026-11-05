@@ -521,6 +521,19 @@ needed. Any field left null is simply never incremented — set up only the
 counters you care about. Never calling `SetupStats()` at all is safe too;
 every counter is then a no-op write-sink.
 
+The trace viewer is separate from those counters. When
+`predictor.enableTraceLog` is on, the host passes its own retired
+instruction count by field name:
+
+```cpp
+HostTraceStats host;
+host.ninst = retiredInstructions; // the model's own counter
+predictor.TraceLogHostStats(host); // or engine.TraceLogHostStats(host)
+```
+
+There is no string key. `HostTraceStats::ninst` is the field. The
+predictor copies it onto the trace and does not interpret it.
+
 ---
 
 ## 6. Configuration knobs

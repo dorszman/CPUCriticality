@@ -39,12 +39,11 @@ using namespace ISQCrit;
 
 namespace {
 
-// ninst: a stand-in for whatever retirement counter a real host already
-// tracks -- this engine has no notion of retirement itself (see
-// TokenEngine::TraceLogStat), so the demo just advances a plausible
-// count itself. Advances by more than 1 per edge to roughly stand in
-// for the many retired instructions around each measured producer-
-// consumer edge that this synthetic workload doesn't otherwise model.
+// ninst: a stand-in for the host model's own retired-instruction
+// counter. The engine does not track retirement; the host writes the
+// field by name (HostTraceStats::ninst). Advances by more than 1 per
+// edge to stand in for the instructions around each measured
+// producer-consumer edge that this synthetic workload does not model.
 void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance, std::uint64_t& ninst) {
     TokenRef producer = engine.DecodeGetToken(pc);
     engine.Tick(t);
@@ -59,7 +58,9 @@ void DoEdge(TokenEngine& engine, Addr pc, Cycle& t, std::int64_t distance, std::
     engine.IsPredictedCritical(pc); // fetch-time lookup, interleaved
 
     ninst += 3;
-    engine.TraceLogStat("ninst", static_cast<std::int64_t>(ninst));
+    HostTraceStats host;
+    host.ninst = static_cast<std::int64_t>(ninst);
+    engine.TraceLogHostStats(host);
 }
 
 } // namespace
